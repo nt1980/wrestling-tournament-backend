@@ -910,6 +910,61 @@ app.get('/api/tournaments/:id/results', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
+// PROGRAMME PUBLIC
+// ─────────────────────────────────────────────
+
+app.get('/api/tournaments/:id/programme', async (req, res) => {
+  try {
+    const t = await pool.query(
+      'SELECT public_page_enabled, public_program_enabled FROM tournaments WHERE id=$1 OR slug=$1',
+      [req.params.id]
+    );
+    if (!t.rows.length) return res.status(404).json({ error: 'Tournoi introuvable' });
+    if (!t.rows[0].public_page_enabled || !t.rows[0].public_program_enabled)
+      return res.status(403).json({ error: 'Programme non public' });
+
+    // Competitions
+    const comps = await pool.query(
+      `SELECT c.*, COUNT(ca.athlete_id) as athlete_count
+       FROM competitions c
+       LEFT JOIN (
+         SELECT DISTINCT athlete_id, competition_id FROM pool_athletes
+       ) ca ON ca.competition_id = c.id
+       WHERE c.tournament_id=$1
+       GROUP BY c.id
+       ORDER BY c.age_category, c.weight_category`,
+      [req.params.id]
+    );
+
+    // Pools with athletes
+    const pools = await pool.query(
+      `SELECT p.*, c.age_category, c.weight_category, c.style, c.gender,
+              json_agg(json_build_object(
+                'athlete_id', a.id,
+                'name', a.first_name||' '||a.last_name,
+                'club', COALESCE(cl.short_name, cl.name),
+                'weight', tr.weigh_in_weight_kg
+              ) ORDER BY a.last_name) as athletes
+       FROM pools p
+       JOIN competitions c ON c.id = p.competition_id
+       LEFT JOIN pool_athletes pa ON pa.pool_id = p.id
+       LEFT JOIN athletes a ON a.id = pa.athlete_id
+       LEFT JOIN clubs cl ON cl.id = a.club_id
+       LEFT JOIN tournament_registrations tr ON tr.athlete_id = a.id AND tr.tournament_id = c.tournament_id
+       WHERE c.tournament_id = $1
+       GROUP BY p.id, c.age_category, c.weight_category, c.style, c.gender
+       ORDER BY c.age_category, c.weight_category, p.name`,
+      [req.params.id]
+    );
+
+    res.json({ competitions: comps.rows, pools: pools.rows });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// ─────────────────────────────────────────────
 // DASHBOARD STATS
 // ─────────────────────────────────────────────
 
