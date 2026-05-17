@@ -8,6 +8,8 @@ import jwt from 'jsonwebtoken';
 import { WebSocketServer } from 'ws';
 import { createServer } from 'http';
 import { parse as csvParse } from 'csv-parse/sync';
+import { generateNordic, generatePoolsAndFinals, generateBracket } from './services/bracket.js';
+import { computePoolRankings, computeBracketRankings } from './services/ranking.js';
 
 dotenv.config();
 
@@ -946,6 +948,196 @@ app.get('/api/tournaments/:id/audit', verifyToken, async (req, res) => {
       [req.params.id]
     );
     res.json(r.rows);
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// ─────────────────────────────────────────────
+// MATCH — GET SINGLE
+// ─────────────────────────────────────────────
+
+app.get('/api/matches/:matchId', async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT m.*,
+        ra.first_name||' '||ra.last_name as red_name, rc.short_name as red_club,
+        ba.first_name||' '||ba.last_name as blue_name, bc.short_name as blue_club,
+        wa.first_name||' '||wa.last_name as winner_name,
+        mt.name as mat_name,
+        comp.style, comp.age_category, comp.weight_category, comp.gender
+       FROM matches m
+       LEFT JOIN athletes ra ON ra.id=m.red_athlete_id LEFT JOIN clubs rc ON rc.id=ra.club_id
+       LEFT JOIN athletes ba ON ba.id=m.blue_athlete_id LEFT JOIN clubs bc ON bc.id=ba.club_id
+       LEFT JOIN athletes wa ON wa.id=m.winner_id
+       LEFT JOIN mats mt ON mt.id=m.mat_id
+       LEFT JOIN competitions comp ON comp.id=m.competition_id
+       WHERE m.id=$1`,
+      [req.params.matchId]
+    );
+    if (!r.rows.length) return res.status(404).json({ error: 'Combat introuvable' });
+    res.json(r.rows[0]);
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// ─────────────────────────────────────────────
+// BRACKET GENERATION
+// ─────────────────────────────────────────────
+
+app.post('/api/competitions/:compId/generate-bracket', verifyToken, async (req, res) => {
+  try {
+    const { compId } = req.params;
+    const compR = await pool.query('SELECT * FROM competitions WHERE id=$1', [compId]);
+    if (!compR.rows.length) return res.status(404).json({ error: 'Compétition introuvable' });
+    const comp = compR.rows[0];
+
+    if (!await hasTournamentRole(req.user.userId, comp.tournament_id, ['tournament_admin'])) return res.status(403).json({ error: 'Accès refusé' });
+
+    // Récupérer les athlètes inscrits dans cette compétition
+    const athletesR = await pool.query(
+      `SELECT a.*, c.short_name as club_short, tr.final_weight_category, tr.final_age_category
+       FROM tournament_registrations tr
+       JOIN athletes a ON a.id=tr.athlete_id
+       LEFT JOIN clubs c ON c.id=a.club_id
+       WHERE tr.competition_id=$1 AND tr.weigh_in_status='done'`,
+      [compId]
+    );
+    const athletes = athletesR.rows;
+    if (athletes.length < 2) return res.status(400).json({ error: 'Pas assez d\'athlètes (minimum 2)' });
+
+    // Supprimer les anciens matchs de cette compétition
+    await pool.query('DELETE FROM repechage_matches WHERE repechage_bracket_id IN (SELECT id FROM repechage_brackets WHERE competition_id=$1)', [compId]);
+    await pool.query('DELETE FROM repechage_brackets WHERE competition_id=$1', [compId]);
+    await pool.query('DELETE FROM match_queue WHERE match_id IN (SELECT id FROM matches WHERE competition_id=$1)', [compId]);
+    await pool.query('DELETE FROM pool_athletes WHERE pool_id IN (SELECT id FROM pools WHERE competition_id=$1)', [compId]);
+    await pool.query('DELETE FROM matches WHERE competition_id=$1', [compId]);
+    await pool.query('DELETE FROM pools WHERE competition_id=$1', [compId]);
+
+    let result;
+    if (comp.format_type === 'nordic') {
+      const matches = await generateNordic(compId, comp.tournament_id, athletes, null);
+      // Ajouter à la queue
+      for (let i = 0; i < matches.length; i++) {
+        await pool.query('INSERT INTO match_queue(id,tournament_id,match_id,position,status) VALUES($1,$2,$3,$4,$5)',
+          [uuidv4(), comp.tournament_id, matches[i].id, i + 1, 'ready']);
+      }
+      result = { format: 'nordic', matches: matches.length };
+    } else if (comp.format_type === 'pools_finals') {
+      result = await generatePoolsAndFinals(compId, comp.tournament_id, athletes, comp.repechage_mode);
+      // Ajouter les matchs de poule à la queue
+      const readyMatches = await pool.query("SELECT id FROM matches WHERE competition_id=$1 AND status='ready'", [compId]);
+      for (let i = 0; i < readyMatches.rows.length; i++) {
+        await pool.query('INSERT INTO match_queue(id,tournament_id,match_id,position,status) VALUES($1,$2,$3,$4,$5)',
+          [uuidv4(), comp.tournament_id, readyMatches.rows[i].id, i + 1, 'ready']);
+      }
+    } else {
+      result = await generateBracket(compId, comp.tournament_id, athletes, comp.repechage_mode);
+      // Ajouter les matchs ready à la queue
+      const readyMatches = await pool.query("SELECT id FROM matches WHERE competition_id=$1 AND status='ready'", [compId]);
+      for (let i = 0; i < readyMatches.rows.length; i++) {
+        await pool.query('INSERT INTO match_queue(id,tournament_id,match_id,position,status) VALUES($1,$2,$3,$4,$5)',
+          [uuidv4(), comp.tournament_id, readyMatches.rows[i].id, i + 1, 'ready']);
+      }
+    }
+
+    await audit(comp.tournament_id, req.user.userId, 'GENERATE_BRACKET', 'competition', compId, null, { format: comp.format_type, athletes: athletes.length });
+    broadcastToTournament(comp.tournament_id, { type: 'bracket_generated', competition_id: compId });
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    console.error('Bracket generation error:', e);
+    res.status(500).json({ error: e.message || 'Erreur génération tableau' });
+  }
+});
+
+// ─────────────────────────────────────────────
+// RANKINGS
+// ─────────────────────────────────────────────
+
+app.get('/api/competitions/:compId/rankings', async (req, res) => {
+  try {
+    const compR = await pool.query('SELECT * FROM competitions WHERE id=$1', [req.params.compId]);
+    if (!compR.rows.length) return res.status(404).json({ error: 'Compétition introuvable' });
+    const comp = compR.rows[0];
+
+    let rankings;
+    if (comp.format_type === 'bracket_repechage') {
+      rankings = await computeBracketRankings(req.params.compId);
+    } else {
+      rankings = await computePoolRankings(req.params.compId);
+    }
+    res.json(rankings);
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// ─────────────────────────────────────────────
+// STATS CLUBS PAR TOURNOI
+// ─────────────────────────────────────────────
+
+app.get('/api/tournaments/:id/stats/clubs', verifyToken, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT c.id, c.name, c.short_name,
+        COUNT(tr.id) as total,
+        COUNT(CASE WHEN tr.final_age_category IS NOT NULL THEN 1 END) as categorized,
+        json_agg(json_build_object('category', tr.final_age_category, 'style', tr.final_style, 'athlete', a.last_name||' '||a.first_name) ORDER BY tr.final_age_category) as athletes
+       FROM tournament_registrations tr
+       JOIN athletes a ON a.id=tr.athlete_id
+       LEFT JOIN clubs c ON c.id=a.club_id
+       WHERE tr.tournament_id=$1
+       GROUP BY c.id, c.name, c.short_name
+       ORDER BY total DESC`,
+      [req.params.id]
+    );
+    res.json(r.rows);
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// ─────────────────────────────────────────────
+// BRACKET VIEW DATA
+// ─────────────────────────────────────────────
+
+app.get('/api/competitions/:compId/bracket', async (req, res) => {
+  try {
+    const matches = await pool.query(
+      `SELECT m.*,
+        ra.first_name||' '||ra.last_name as red_name, rc.short_name as red_club,
+        ba.first_name||' '||ba.last_name as blue_name, bc.short_name as blue_club,
+        wa.first_name||' '||wa.last_name as winner_name,
+        mt.name as mat_name
+       FROM matches m
+       LEFT JOIN athletes ra ON ra.id=m.red_athlete_id LEFT JOIN clubs rc ON rc.id=ra.club_id
+       LEFT JOIN athletes ba ON ba.id=m.blue_athlete_id LEFT JOIN clubs bc ON bc.id=ba.club_id
+       LEFT JOIN athletes wa ON wa.id=m.winner_id
+       LEFT JOIN mats mt ON mt.id=m.mat_id
+       WHERE m.competition_id=$1
+       ORDER BY m.bracket, m.round, m.index_in_round`,
+      [req.params.compId]
+    );
+
+    const pools = await pool.query(
+      `SELECT p.*, json_agg(json_build_object('id',a.id,'name',a.last_name||' '||a.first_name,'club',c.short_name) ORDER BY pa.seed_order) as athletes
+       FROM pools p
+       LEFT JOIN pool_athletes pa ON pa.pool_id=p.id
+       LEFT JOIN athletes a ON a.id=pa.athlete_id
+       LEFT JOIN clubs c ON c.id=a.club_id
+       WHERE p.competition_id=$1
+       GROUP BY p.id ORDER BY p.name`,
+      [req.params.compId]
+    );
+
+    const comp = await pool.query('SELECT * FROM competitions WHERE id=$1', [req.params.compId]);
+
+    res.json({
+      competition: comp.rows[0],
+      matches: matches.rows,
+      pools: pools.rows,
+    });
   } catch (e) {
     res.status(500).json({ error: 'Erreur serveur' });
   }
