@@ -469,12 +469,20 @@ const normalizeDate = (s) => {
 
 const IGNORED_COLS = ['Photo', 'Assurance', 'Mail', 'Téléphone', 'Actions'];
 
+const detectDelimiter = (csv_data) => {
+  const firstLine = csv_data.split('\n')[0];
+  const semicolonCount = (firstLine.match(/;/g) || []).length;
+  const commaCount = (firstLine.match(/,/g) || []).length;
+  return semicolonCount > commaCount ? ';' : ',';
+};
+
 app.post('/api/import/athletes', verifyToken, async (req, res) => {
   try {
     const { csv_data } = req.body;
     if (!csv_data) return res.status(400).json({ error: 'csv_data requis' });
 
-    const records = csvParse(csv_data, { columns: true, skip_empty_lines: true, delimiter: ';', relax_quotes: true });
+    const delimiter = detectDelimiter(csv_data);
+    const records = csvParse(csv_data, { columns: true, skip_empty_lines: true, delimiter, relax_quotes: true });
     let created = 0, updated = 0, errors = [];
 
     for (const row of records) {
@@ -581,7 +589,8 @@ app.post('/api/tournaments/:id/registrations/import', verifyToken, async (req, r
   try {
     if (!await hasTournamentRole(req.user.userId, req.params.id, ['tournament_admin'])) return res.status(403).json({ error: 'Accès refusé' });
     const { csv_data } = req.body;
-    const records = csvParse(csv_data, { columns: true, skip_empty_lines: true, delimiter: ';', relax_quotes: true });
+    const delimiter = detectDelimiter(csv_data);
+    const records = csvParse(csv_data, { columns: true, skip_empty_lines: true, delimiter, relax_quotes: true });
     let registered = 0, errors = [];
 
     for (const row of records) {
@@ -603,6 +612,17 @@ app.post('/api/tournaments/:id/registrations/import', verifyToken, async (req, r
     res.json({ registered, errors });
   } catch (e) {
     res.status(500).json({ error: 'Erreur import inscriptions' });
+  }
+});
+
+app.delete('/api/tournaments/:id/registrations', verifyToken, async (req, res) => {
+  try {
+    if (!await hasTournamentRole(req.user.userId, req.params.id, ['tournament_admin'])) return res.status(403).json({ error: 'Accès refusé' });
+    const r = await pool.query('DELETE FROM tournament_registrations WHERE tournament_id=$1', [req.params.id]);
+    res.json({ deleted: r.rowCount });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Erreur serveur' });
   }
 });
 
