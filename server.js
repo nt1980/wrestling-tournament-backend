@@ -418,6 +418,17 @@ app.post('/api/athletes', verifyToken, async (req, res) => {
   }
 });
 
+app.delete('/api/athletes', verifyToken, async (req, res) => {
+  try {
+    if (!await isSuperAdmin(req.user.userId)) return res.status(403).json({ error: 'Accès refusé' });
+    const r = await pool.query('DELETE FROM athletes');
+    res.json({ deleted: r.rowCount });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
 // ─────────────────────────────────────────────
 // IMPORT CSV FFLDA
 // ─────────────────────────────────────────────
