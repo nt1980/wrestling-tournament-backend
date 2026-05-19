@@ -418,10 +418,77 @@ app.post('/api/athletes', verifyToken, async (req, res) => {
   }
 });
 
+app.put('/api/athletes/:id', verifyToken, async (req, res) => {
+  try {
+    const { first_name, last_name, gender, nationality, birth_date, style, age_category_imported, licensed_age_category, mastery_level, default_weight_kg, license_status, club_id } = req.body;
+    const r = await pool.query(
+      'UPDATE athletes SET first_name=$1,last_name=$2,gender=$3,nationality=$4,birth_date=$5,style=$6,age_category_imported=$7,licensed_age_category=$8,mastery_level=$9,default_weight_kg=$10,license_status=$11,club_id=$12,updated_at=now() WHERE id=$13 RETURNING *',
+      [first_name, last_name, gender, nationality, birth_date, style, age_category_imported, licensed_age_category, mastery_level, default_weight_kg, license_status, club_id, req.params.id]
+    );
+    if (r.rowCount === 0) return res.status(404).json({ error: 'Athlète non trouvé' });
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+app.delete('/api/athletes/:id', verifyToken, async (req, res) => {
+  try {
+    const r = await pool.query('DELETE FROM athletes WHERE id=$1 RETURNING id', [req.params.id]);
+    if (r.rowCount === 0) return res.status(404).json({ error: 'Athlète non trouvé' });
+    res.json({ deleted: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
 app.delete('/api/athletes', verifyToken, async (req, res) => {
   try {
     if (!await isSuperAdmin(req.user.userId)) return res.status(403).json({ error: 'Accès refusé' });
     const r = await pool.query('DELETE FROM athletes');
+    res.json({ deleted: r.rowCount });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// ─────────────────────────────────────────────
+// CLUBS MANAGEMENT
+// ─────────────────────────────────────────────
+
+app.put('/api/clubs/:id', verifyToken, async (req, res) => {
+  try {
+    const { fflda_number, short_name, name, regional_committee } = req.body;
+    const r = await pool.query(
+      'UPDATE clubs SET fflda_number=$1,short_name=$2,name=$3,regional_committee=$4,updated_at=now() WHERE id=$5 RETURNING *',
+      [fflda_number || null, short_name, name, regional_committee || null, req.params.id]
+    );
+    if (r.rowCount === 0) return res.status(404).json({ error: 'Club non trouvé' });
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+app.delete('/api/clubs/:id', verifyToken, async (req, res) => {
+  try {
+    const r = await pool.query('DELETE FROM clubs WHERE id=$1 RETURNING id', [req.params.id]);
+    if (r.rowCount === 0) return res.status(404).json({ error: 'Club non trouvé' });
+    res.json({ deleted: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+app.delete('/api/clubs', verifyToken, async (req, res) => {
+  try {
+    if (!await isSuperAdmin(req.user.userId)) return res.status(403).json({ error: 'Accès refusé' });
+    const r = await pool.query('DELETE FROM clubs');
     res.json({ deleted: r.rowCount });
   } catch (e) {
     console.error(e);
@@ -663,6 +730,18 @@ app.post('/api/tournaments/:id/registrations/import', verifyToken, async (req, r
     res.json({ registered, errors });
   } catch (e) {
     res.status(500).json({ error: 'Erreur import inscriptions' });
+  }
+});
+
+app.delete('/api/tournaments/:id/registrations/:regId', verifyToken, async (req, res) => {
+  try {
+    if (!await hasTournamentRole(req.user.userId, req.params.id, ['tournament_admin'])) return res.status(403).json({ error: 'Accès refusé' });
+    const r = await pool.query('DELETE FROM tournament_registrations WHERE id=$1 AND tournament_id=$2 RETURNING id', [req.params.regId, req.params.id]);
+    if (r.rowCount === 0) return res.status(404).json({ error: 'Inscription non trouvée' });
+    res.json({ deleted: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Erreur serveur' });
   }
 });
 
