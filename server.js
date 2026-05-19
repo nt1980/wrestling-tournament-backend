@@ -476,6 +476,24 @@ const detectDelimiter = (csv_data) => {
   return semicolonCount > commaCount ? ';' : ',';
 };
 
+const normalizeColumnName = (name) => {
+  return name?.trim().toLowerCase().replace(/[éèê]/g, 'e').replace(/[àâ]/g, 'a').replace(/[ôo]/g, 'o').replace(/ç/g, 'c') || '';
+};
+
+const getColumnValue = (row, possibleNames) => {
+  const normalizedRow = {};
+  for (const key in row) {
+    normalizedRow[normalizeColumnName(key)] = row[key];
+  }
+  for (const name of possibleNames) {
+    const normalized = normalizeColumnName(name);
+    if (normalizedRow[normalized] !== undefined) {
+      return normalizedRow[normalized];
+    }
+  }
+  return null;
+};
+
 app.post('/api/import/athletes', verifyToken, async (req, res) => {
   try {
     const { csv_data } = req.body;
@@ -487,37 +505,70 @@ app.post('/api/import/athletes', verifyToken, async (req, res) => {
 
     for (const row of records) {
       try {
-        const fflda_number = row['N° Club']?.trim();
-        const short_name = row['Sigle du Club']?.trim();
-        const club_name = row['Nom du Club']?.trim();
-        const regional_committee = row['Comité Régional']?.trim();
+        const fflda_number = getColumnValue(row, ['N° Club', 'N Club', 'Numero Club'])?.trim();
+        const short_name = getColumnValue(row, ['Sigle du Club', 'Sigle Club', 'Club Sigle'])?.trim();
+        const club_name = getColumnValue(row, ['Nom du Club', 'Nom Club', 'Club Name'])?.trim();
+        const regional_committee = getColumnValue(row, ['Comité Régional', 'Comite Regional', 'Regional Committee'])?.trim();
 
         let club_id = null;
-        if (fflda_number || club_name) {
-          const club = await pool.query(
-            'INSERT INTO clubs(id,fflda_number,short_name,name,regional_committee) VALUES($1,$2,$3,$4,$5) ON CONFLICT(fflda_number) DO UPDATE SET name=EXCLUDED.name,short_name=EXCLUDED.short_name RETURNING id',
-            [uuidv4(), fflda_number || null, short_name || '', club_name || '', regional_committee || null]
-          );
-          club_id = club.rows[0].id;
+        if (club_name) {
+          let clubResult;
+          if (fflda_number) {
+            clubResult = await pool.query(
+              'SELECT id FROM clubs WHERE fflda_number=$1 LIMIT 1',
+              [fflda_number]
+            );
+            if (clubResult.rowCount > 0) {
+              club_id = clubResult.rows[0].id;
+              await pool.query(
+                'UPDATE clubs SET name=$1,short_name=$2,regional_committee=$3 WHERE id=$4',
+                [club_name || '', short_name || '', regional_committee || null, club_id]
+              );
+            } else {
+              const newClub = await pool.query(
+                'INSERT INTO clubs(id,fflda_number,short_name,name,regional_committee) VALUES($1,$2,$3,$4,$5) RETURNING id',
+                [uuidv4(), fflda_number, short_name || '', club_name, regional_committee || null]
+              );
+              club_id = newClub.rows[0].id;
+            }
+          } else {
+            clubResult = await pool.query(
+              'SELECT id FROM clubs WHERE name=$1 LIMIT 1',
+              [club_name]
+            );
+            if (clubResult.rowCount > 0) {
+              club_id = clubResult.rows[0].id;
+              await pool.query(
+                'UPDATE clubs SET short_name=$1,regional_committee=$2 WHERE id=$3',
+                [short_name || '', regional_committee || null, club_id]
+              );
+            } else {
+              const newClub = await pool.query(
+                'INSERT INTO clubs(id,short_name,name,regional_committee) VALUES($1,$2,$3,$4) RETURNING id',
+                [uuidv4(), short_name || '', club_name, regional_committee || null]
+              );
+              club_id = newClub.rows[0].id;
+            }
+          }
         }
 
-        const license_number = row['N° Licence']?.trim();
+        const license_number = getColumnValue(row, ['N° Licence', 'N Licence', 'License Number'])?.trim();
         if (!license_number) continue;
 
         const existing = await pool.query('SELECT id FROM athletes WHERE license_number=$1', [license_number]);
         const athleteData = {
           license_number,
-          first_name: row['Prénom']?.trim(),
-          last_name: row['Nom']?.trim(),
-          gender: normalizeGender(row['Sexe']),
-          nationality: row['Nationalité']?.trim() || 'France',
-          birth_date: normalizeDate(row['Date de naissance']),
-          style: normalizeStyle(row['Style']),
-          age_category_imported: row['Catégorie d\'âge']?.trim(),
-          licensed_age_category: row['Cat âge licencié']?.trim(),
-          mastery_level: row['Maîtrise']?.trim(),
-          default_weight_kg: normalizeWeight(row['Poids']),
-          license_status: row['Statut']?.trim(),
+          first_name: getColumnValue(row, ['Prénom', 'Prenom', 'First Name'])?.trim(),
+          last_name: getColumnValue(row, ['Nom', 'Name'])?.trim(),
+          gender: normalizeGender(getColumnValue(row, ['Sexe', 'Gender'])),
+          nationality: getColumnValue(row, ['Nationalité', 'Nationalite', 'Nationality'])?.trim() || 'France',
+          birth_date: normalizeDate(getColumnValue(row, ['Date de naissance', 'Date Naissance', 'Birth Date'])),
+          style: normalizeStyle(getColumnValue(row, ['Style'])),
+          age_category_imported: getColumnValue(row, ['Catégorie d\'âge', 'Categorie age', 'Age Category'])?.trim(),
+          licensed_age_category: getColumnValue(row, ['Cat âge licencié', 'Cat age licencie', 'Licensed Age Category'])?.trim(),
+          mastery_level: getColumnValue(row, ['Maîtrise', 'Maitrise', 'Mastery'])?.trim(),
+          default_weight_kg: normalizeWeight(getColumnValue(row, ['Poids', 'Weight'])),
+          license_status: getColumnValue(row, ['Statut', 'Status'])?.trim(),
           club_id,
         };
 
@@ -595,18 +646,18 @@ app.post('/api/tournaments/:id/registrations/import', verifyToken, async (req, r
 
     for (const row of records) {
       try {
-        const license_number = row['N° Licence']?.trim();
+        const license_number = getColumnValue(row, ['N° Licence', 'N Licence', 'License Number'])?.trim();
         if (!license_number) continue;
         const athlete = await pool.query('SELECT id FROM athletes WHERE license_number=$1', [license_number]);
         if (!athlete.rowCount) continue;
         const athleteId = athlete.rows[0].id;
         await pool.query(
           'INSERT INTO tournament_registrations(id,tournament_id,athlete_id,final_style,final_age_category) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING',
-          [uuidv4(), req.params.id, athleteId, normalizeStyle(row['Style']), row['Catégorie d\'âge']?.trim() || null]
+          [uuidv4(), req.params.id, athleteId, normalizeStyle(getColumnValue(row, ['Style'])), getColumnValue(row, ['Catégorie d\'âge', 'Categorie age', 'Age Category'])?.trim() || null]
         );
         registered++;
       } catch (rowErr) {
-        errors.push({ license: row['N° Licence'], error: rowErr.message });
+        errors.push({ license: license_number, error: rowErr.message });
       }
     }
     res.json({ registered, errors });
