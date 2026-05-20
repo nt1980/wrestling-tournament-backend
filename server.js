@@ -869,16 +869,53 @@ app.get('/api/tournaments/:id/stats/clubs', verifyToken, async (req, res) => {
 // COMPETITIONS — GÉNÉRATION AUTOMATIQUE
 // ─────────────────────────────────────────────
 
+// Options disponibles pour filtrer la génération (styles + catégories d'âge des inscrits pesés)
+app.get('/api/tournaments/:id/competitions/options', verifyToken, async (req, res) => {
+  try {
+    if (!await canAccessTournament(req.user.userId, req.params.id)) return res.status(403).json({ error: 'Accès refusé' });
+    const r = await pool.query(
+      `SELECT DISTINCT COALESCE(tr.final_style, a.style) as style, tr.final_age_category as age_category
+       FROM tournament_registrations tr
+       JOIN athletes a ON a.id = tr.athlete_id
+       WHERE tr.tournament_id = $1
+         AND tr.weigh_in_status = 'done'
+         AND tr.final_age_category IS NOT NULL
+         AND tr.final_weight_category IS NOT NULL
+       ORDER BY style, age_category`,
+      [req.params.id]
+    );
+    const rows = r.rows;
+    const styles = [...new Set(rows.map(row => row.style).filter(Boolean))].sort();
+    const age_categories = [...new Set(rows.map(row => row.age_category).filter(Boolean))].sort();
+    res.json({ styles, age_categories });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
 app.post('/api/tournaments/:id/competitions/generate', verifyToken, async (req, res) => {
   try {
     if (!await hasTournamentRole(req.user.userId, req.params.id, ['tournament_admin'])) return res.status(403).json({ error: 'Accès refusé' });
     const tournamentId = req.params.id;
+    const { style: filterStyle, age_category: filterAge } = req.body;
 
-    // Récupérer tous les inscrits pesés
+    // Récupérer les inscrits pesés (avec filtres optionnels)
+    const params = [tournamentId];
+    let extraFilters = '';
+    if (filterStyle) {
+      params.push(filterStyle);
+      extraFilters += ` AND COALESCE(tr.final_style, a.style) = $${params.length}`;
+    }
+    if (filterAge) {
+      params.push(filterAge);
+      extraFilters += ` AND tr.final_age_category = $${params.length}`;
+    }
+
     const regs = await pool.query(
       `SELECT tr.*,a.style,a.gender FROM tournament_registrations tr JOIN athletes a ON a.id=tr.athlete_id
-       WHERE tr.tournament_id=$1 AND tr.weigh_in_status='done' AND tr.final_age_category IS NOT NULL AND tr.final_weight_category IS NOT NULL`,
-      [tournamentId]
+       WHERE tr.tournament_id=$1 AND tr.weigh_in_status='done' AND tr.final_age_category IS NOT NULL AND tr.final_weight_category IS NOT NULL${extraFilters}`,
+      params
     );
 
     // Grouper par style+gender+age_category+weight_category
