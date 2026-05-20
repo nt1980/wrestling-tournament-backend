@@ -375,13 +375,39 @@ app.get('/api/tournaments/:id/users', verifyToken, async (req, res) => {
 app.post('/api/tournaments/:id/users', verifyToken, async (req, res) => {
   try {
     if (!await hasTournamentRole(req.user.userId, req.params.id, ['tournament_admin'])) return res.status(403).json({ error: 'Accès refusé' });
-    const { user_id, role } = req.body;
+
+    const { user_id, email, name, password, role } = req.body;
+    if (!role) return res.status(400).json({ error: 'role requis' });
+
+    let targetUserId = user_id;
+
+    // Mode création/recherche par email (accessible à l'admin tournoi)
+    if (!targetUserId && email && name) {
+      const existing = await pool.query('SELECT id FROM users WHERE email=$1', [email]);
+      if (existing.rows.length > 0) {
+        // Compte existant → on réutilise (le mot de passe n'est pas modifié)
+        targetUserId = existing.rows[0].id;
+      } else {
+        // Nouveau compte
+        if (!password) return res.status(400).json({ error: 'Mot de passe requis pour créer un compte' });
+        const hash = await bcrypt.hash(password, 10);
+        targetUserId = uuidv4();
+        await pool.query(
+          'INSERT INTO users(id,email,password_hash,name) VALUES($1,$2,$3,$4)',
+          [targetUserId, email, hash, name]
+        );
+      }
+    }
+
+    if (!targetUserId) return res.status(400).json({ error: 'user_id ou email/name requis' });
+
     const r = await pool.query(
       'INSERT INTO tournament_users(id,tournament_id,user_id,role) VALUES($1,$2,$3,$4) ON CONFLICT(tournament_id,user_id,role) DO NOTHING RETURNING *',
-      [uuidv4(), req.params.id, user_id, role]
+      [uuidv4(), req.params.id, targetUserId, role]
     );
-    res.status(201).json(r.rows[0]);
+    res.status(201).json(r.rows[0] ?? { tournament_id: req.params.id, user_id: targetUserId, role });
   } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ error: 'Email déjà utilisé' });
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
