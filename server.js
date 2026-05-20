@@ -912,6 +912,25 @@ app.post('/api/tournaments/:id/competitions/generate', verifyToken, async (req, 
       extraFilters += ` AND tr.final_age_category = $${params.length}`;
     }
 
+    // Vérifier qu'il n'y a aucune pesée en attente dans la sélection
+    const pendingCheck = await pool.query(
+      `SELECT COUNT(*) as cnt,
+              STRING_AGG(DISTINCT COALESCE(a.last_name||' '||a.first_name, '?'), ', ' ORDER BY COALESCE(a.last_name||' '||a.first_name, '?')) as names
+       FROM tournament_registrations tr
+       JOIN athletes a ON a.id = tr.athlete_id
+       WHERE tr.tournament_id=$1 AND tr.weigh_in_status='pending'${extraFilters}`,
+      params
+    );
+    const pendingCount = parseInt(pendingCheck.rows[0].cnt);
+    if (pendingCount > 0) {
+      const label = [filterAge, filterStyle].filter(Boolean).join(' · ');
+      return res.status(409).json({
+        error: `${pendingCount} pesée${pendingCount > 1 ? 's' : ''} en attente${label ? ` (${label})` : ''} — complétez la pesée avant de générer.`,
+        pending_count: pendingCount,
+        pending_names: pendingCheck.rows[0].names,
+      });
+    }
+
     const regs = await pool.query(
       `SELECT tr.*,a.style,a.gender FROM tournament_registrations tr JOIN athletes a ON a.id=tr.athlete_id
        WHERE tr.tournament_id=$1 AND tr.weigh_in_status='done' AND tr.final_age_category IS NOT NULL AND tr.final_weight_category IS NOT NULL${extraFilters}`,
