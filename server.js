@@ -1131,21 +1131,47 @@ app.get('/api/tournaments/:id/programme', async (req, res) => {
 
 app.get('/api/tournaments/:id/dashboard', verifyToken, async (req, res) => {
   try {
-    const [athletes, clubs, comps, matchesTotal, matchesDone, matsActive] = await Promise.all([
+    const [athletes, clubs, comps, matchesTotal, matchesDone, matsActive, weighStats, queueStats] = await Promise.all([
       pool.query('SELECT COUNT(*) FROM tournament_registrations WHERE tournament_id=$1', [req.params.id]),
       pool.query('SELECT COUNT(DISTINCT a.club_id) FROM tournament_registrations tr JOIN athletes a ON a.id=tr.athlete_id WHERE tr.tournament_id=$1', [req.params.id]),
       pool.query('SELECT COUNT(*) FROM competitions WHERE tournament_id=$1', [req.params.id]),
       pool.query('SELECT COUNT(*) FROM matches WHERE tournament_id=$1 AND is_bye=false', [req.params.id]),
       pool.query("SELECT COUNT(*) FROM matches WHERE tournament_id=$1 AND status='finished' AND is_bye=false", [req.params.id]),
       pool.query("SELECT COUNT(*) FROM mats WHERE tournament_id=$1 AND is_active=true", [req.params.id]),
+      pool.query(`
+        SELECT
+          COUNT(*) AS total,
+          COUNT(CASE WHEN weigh_in_status='done'       THEN 1 END) AS done,
+          COUNT(CASE WHEN weigh_in_status='overweight' THEN 1 END) AS overweight,
+          COUNT(CASE WHEN weigh_in_status='no_show'    THEN 1 END) AS no_show,
+          COUNT(CASE WHEN weigh_in_status='pending'    THEN 1 END) AS pending
+        FROM tournament_registrations WHERE tournament_id=$1`, [req.params.id]),
+      pool.query(`
+        SELECT
+          COUNT(CASE WHEN status='on_mat' THEN 1 END) AS on_mat,
+          COUNT(CASE WHEN status='ready'  THEN 1 END) AS ready
+        FROM match_queue WHERE tournament_id=$1`, [req.params.id]),
     ]);
+    const w = weighStats.rows[0];
+    const q = queueStats.rows[0];
     res.json({
-      athletes: parseInt(athletes.rows[0].count),
-      clubs: parseInt(clubs.rows[0].count),
+      athletes:     parseInt(athletes.rows[0].count),
+      clubs:        parseInt(clubs.rows[0].count),
       competitions: parseInt(comps.rows[0].count),
       matches_total: parseInt(matchesTotal.rows[0].count),
-      matches_done: parseInt(matchesDone.rows[0].count),
-      mats_active: parseInt(matsActive.rows[0].count),
+      matches_done:  parseInt(matchesDone.rows[0].count),
+      mats_active:   parseInt(matsActive.rows[0].count),
+      weigh_in: {
+        total:      parseInt(w.total),
+        done:       parseInt(w.done),
+        overweight: parseInt(w.overweight),
+        no_show:    parseInt(w.no_show),
+        pending:    parseInt(w.pending),
+      },
+      queue: {
+        on_mat: parseInt(q.on_mat),
+        ready:  parseInt(q.ready),
+      },
     });
   } catch (e) {
     res.status(500).json({ error: 'Erreur serveur' });
