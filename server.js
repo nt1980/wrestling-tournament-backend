@@ -59,6 +59,16 @@ const hasTournamentRole = async (userId, tournamentId, roles = []) => {
   return r.rowCount > 0;
 };
 
+// Vérifie qu'un utilisateur a AU MOINS UN rôle sur ce tournoi (lecture)
+const canAccessTournament = async (userId, tournamentId) => {
+  if (await isSuperAdmin(userId)) return true;
+  const r = await pool.query(
+    'SELECT 1 FROM tournament_users WHERE user_id=$1 AND tournament_id=$2',
+    [userId, tournamentId]
+  );
+  return r.rowCount > 0;
+};
+
 const audit = async (tournamentId, userId, action, entityType, entityId, oldData = null, newData = null) => {
   await pool.query(
     'INSERT INTO audit_logs(tournament_id,user_id,action,entity_type,entity_id,old_data,new_data) VALUES($1,$2,$3,$4,$5,$6,$7)',
@@ -220,10 +230,45 @@ app.put('/api/clubs/:id', verifyToken, async (req, res) => {
 app.get('/api/tournaments', async (req, res) => {
   try {
     const { public_only } = req.query;
-    let q = `SELECT t.*,c.name as organizer_club_name,c.short_name as organizer_club_short FROM tournaments t LEFT JOIN clubs c ON c.id=t.organizer_club_id`;
-    if (public_only === 'true') q += ` WHERE t.public_page_enabled=true`;
-    q += ` ORDER BY t.event_date DESC`;
-    const r = await pool.query(q);
+
+    // Endpoint public : pages publiques uniquement
+    if (public_only === 'true') {
+      const r = await pool.query(
+        `SELECT t.*,c.name as organizer_club_name,c.short_name as organizer_club_short
+         FROM tournaments t LEFT JOIN clubs c ON c.id=t.organizer_club_id
+         WHERE t.public_page_enabled=true ORDER BY t.event_date DESC`
+      );
+      return res.json(r.rows);
+    }
+
+    // Endpoint privé : authentification requise
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'Token requis' });
+    let decoded;
+    try { decoded = jwt.verify(token, JWT_SECRET); }
+    catch { return res.status(401).json({ error: 'Token invalide' }); }
+
+    const userId = decoded.userId;
+    let r;
+
+    if (await isSuperAdmin(userId)) {
+      // Super admin : voit tout
+      r = await pool.query(
+        `SELECT t.*,c.name as organizer_club_name,c.short_name as organizer_club_short
+         FROM tournaments t LEFT JOIN clubs c ON c.id=t.organizer_club_id
+         ORDER BY t.event_date DESC`
+      );
+    } else {
+      // Utilisateur normal : uniquement les tournois auxquels il est affecté
+      r = await pool.query(
+        `SELECT DISTINCT t.*,c.name as organizer_club_name,c.short_name as organizer_club_short
+         FROM tournaments t
+         LEFT JOIN clubs c ON c.id=t.organizer_club_id
+         JOIN tournament_users tu ON tu.tournament_id=t.id AND tu.user_id=$1
+         ORDER BY t.event_date DESC`,
+        [userId]
+      );
+    }
     res.json(r.rows);
   } catch (e) {
     res.status(500).json({ error: 'Erreur serveur' });
@@ -673,6 +718,7 @@ app.post('/api/import/athletes', verifyToken, async (req, res) => {
 
 app.get('/api/tournaments/:id/registrations', verifyToken, async (req, res) => {
   try {
+    if (!await canAccessTournament(req.user.userId, req.params.id)) return res.status(403).json({ error: 'Accès refusé' });
     const r = await pool.query(
       `SELECT tr.*,a.first_name,a.last_name,a.license_number,a.gender,a.birth_date,a.default_weight_kg,
               c.name as club_name,c.short_name as club_short
@@ -775,6 +821,7 @@ app.put('/api/tournaments/:id/registrations/:regId/weigh-in', verifyToken, async
 // Stats inscriptions par club
 app.get('/api/tournaments/:id/stats/clubs', verifyToken, async (req, res) => {
   try {
+    if (!await canAccessTournament(req.user.userId, req.params.id)) return res.status(403).json({ error: 'Accès refusé' });
     const r = await pool.query(
       `SELECT c.id,c.name,c.short_name,COUNT(tr.id) as total,
         jsonb_object_agg(COALESCE(tr.final_age_category,'?'), cnt) as by_category
@@ -1131,6 +1178,7 @@ app.get('/api/tournaments/:id/programme', async (req, res) => {
 
 app.get('/api/tournaments/:id/dashboard', verifyToken, async (req, res) => {
   try {
+    if (!await canAccessTournament(req.user.userId, req.params.id)) return res.status(403).json({ error: 'Accès refusé' });
     const [athletes, clubs, comps, matchesTotal, matchesDone, matsActive, weighStats, queueStats] = await Promise.all([
       pool.query('SELECT COUNT(*) FROM tournament_registrations WHERE tournament_id=$1', [req.params.id]),
       pool.query('SELECT COUNT(DISTINCT a.club_id) FROM tournament_registrations tr JOIN athletes a ON a.id=tr.athlete_id WHERE tr.tournament_id=$1', [req.params.id]),
@@ -1321,6 +1369,7 @@ app.get('/api/competitions/:compId/rankings', async (req, res) => {
 
 app.get('/api/tournaments/:id/stats/clubs', verifyToken, async (req, res) => {
   try {
+    if (!await canAccessTournament(req.user.userId, req.params.id)) return res.status(403).json({ error: 'Accès refusé' });
     const r = await pool.query(
       `SELECT c.id, c.name, c.short_name,
         COUNT(tr.id) as total,
