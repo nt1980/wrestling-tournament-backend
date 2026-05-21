@@ -1389,7 +1389,20 @@ app.post('/api/competitions/:compId/generate-bracket', verifyToken, async (req, 
 
     let result;
     if (comp.format_type === 'nordic') {
-      const matches = await generateNordic(compId, comp.tournament_id, athletes, null);
+      // Créer la poule unique (round-robin complet)
+      const poolId = uuidv4();
+      const poolResult = await pool.query(
+        `INSERT INTO pools(id, competition_id, tournament_id, name, status) VALUES($1,$2,$3,$4,$5) RETURNING *`,
+        [poolId, compId, comp.tournament_id, 'Poule', 'active']
+      );
+      for (let i = 0; i < athletes.length; i++) {
+        await pool.query(
+          `INSERT INTO pool_athletes(id, pool_id, athlete_id, seed_order) VALUES($1,$2,$3,$4)`,
+          [uuidv4(), poolId, athletes[i].id, i + 1]
+        );
+      }
+      const poolObj = poolResult.rows[0];
+      const matches = await generateNordic(compId, comp.tournament_id, athletes, poolObj);
       // Ajouter à la queue
       for (let i = 0; i < matches.length; i++) {
         await pool.query('INSERT INTO match_queue(id,tournament_id,match_id,position,status) VALUES($1,$2,$3,$4,$5)',
