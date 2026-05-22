@@ -53,7 +53,7 @@ async function insertMatch(client, fields) {
       red_athlete_id, blue_athlete_id,
       winner_id, loser_id,
       winner_to, loser_to,
-      parent_match_ids ? JSON.stringify(parent_match_ids) : null,
+      parent_match_ids ?? null,
       status, is_bye, scheduled_order,
     ]
   );
@@ -396,9 +396,10 @@ export async function generatePoolsAndFinals(
       knockoutClient.release();
     }
   } catch (err) {
-    // pool creation transaction already rolled back above if it threw
-    client.release();
+    try { await client.query('ROLLBACK'); } catch {} // no-op si déjà committé
     throw err;
+  } finally {
+    client.release();
   }
 }
 
@@ -588,7 +589,7 @@ export async function generateBracket(
       // Full repechage: create repechage_brackets for each finalist side
       // and build the repechage ladder.
 
-      for (const side of ['A', 'B']) {
+      for (const side of ['top', 'bottom']) {
         const rbId = uuidv4();
         const rbResult = await client.query(
           `INSERT INTO repechage_brackets
@@ -647,7 +648,7 @@ export async function generateBracket(
                 uuidv4(),
                 rbId,
                 rmId,
-                JSON.stringify(slot.sourceMainMatchIds),
+                slot.sourceMainMatchIds,
                 level,
               ]
             );
@@ -827,8 +828,8 @@ function buildRepechageGrid(side, numRounds, matchGrid) {
     // A simpler model: side A = indices 0..count/2-1, side B = the rest, where count = matchesInRound.length
     const count = mainMatchesInRound.length;
     const sideACount = count / 2;
-    const startIdx = side === 'A' ? 0 : sideACount;
-    const endIdx = side === 'A' ? sideACount : count;
+    const startIdx = side === 'top' ? 0 : sideACount;
+    const endIdx = side === 'top' ? sideACount : count;
 
     const losersFromThisRound = [];
     for (let i = startIdx; i < endIdx; i++) {
@@ -873,8 +874,8 @@ async function patchMainBracketLoserTo(client, side, numRounds, matchGrid, sideR
     const mainMatchesInRound = matchGrid[r];
     const count = mainMatchesInRound.length;
     const sideACount = count / 2;
-    const startIdx = side === 'A' ? 0 : sideACount;
-    const endIdx = side === 'A' ? sideACount : count;
+    const startIdx = side === 'top' ? 0 : sideACount;
+    const endIdx = side === 'top' ? sideACount : count;
 
     const repLevel = sideRepGrid[r] ?? null;
     if (!repLevel) continue;
