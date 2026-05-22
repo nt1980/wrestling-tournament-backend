@@ -1231,10 +1231,14 @@ app.get('/api/tournaments/:id/queue', async (req, res) => {
   try {
     const r = await pool.query(
       `SELECT mq.*,m.score_red,m.score_blue,m.status as match_status,m.bracket,m.match_type,
+        m.round, m.pool_id,
+        (SELECT MAX(m2.round) FROM matches m2
+          WHERE m2.competition_id=m.competition_id AND m2.bracket IN ('main','final')) AS max_round,
         r.first_name||' '||r.last_name as red_name, rc.short_name as red_club,
         b.first_name||' '||b.last_name as blue_name, bc.short_name as blue_club,
         mt.name as mat_name,
-        comp.style,comp.age_category,comp.weight_category,comp.gender
+        p.name as pool_name,
+        comp.style,comp.age_category,comp.weight_category,comp.gender,comp.format_type
        FROM match_queue mq
        JOIN matches m ON m.id=mq.match_id
        LEFT JOIN athletes r ON r.id=m.red_athlete_id
@@ -1243,6 +1247,7 @@ app.get('/api/tournaments/:id/queue', async (req, res) => {
        LEFT JOIN clubs bc ON bc.id=b.club_id
        LEFT JOIN mats mt ON mt.id=mq.mat_id
        LEFT JOIN competitions comp ON comp.id=m.competition_id
+       LEFT JOIN pools p ON p.id=m.pool_id
        WHERE mq.tournament_id=$1 AND mq.status NOT IN ('finished')
        ORDER BY mq.mat_id NULLS LAST,mq.position`,
       [req.params.id]
