@@ -428,7 +428,13 @@ app.delete('/api/tournaments/:id/users/:userId', verifyToken, async (req, res) =
 
 app.get('/api/tournaments/:id/mats', async (req, res) => {
   try {
-    const r = await pool.query('SELECT * FROM mats WHERE tournament_id=$1 ORDER BY name', [req.params.id]);
+    const r = await pool.query(
+      `SELECT m.*, u.id as referee_id, u.name as referee_name
+       FROM mats m
+       LEFT JOIN users u ON u.id = m.referee_id
+       WHERE m.tournament_id = $1 ORDER BY m.name`,
+      [req.params.id]
+    );
     res.json(r.rows);
   } catch (e) {
     res.status(500).json({ error: 'Erreur serveur' });
@@ -518,6 +524,60 @@ app.delete('/api/mats/:matId', verifyToken, async (req, res) => {
     await pool.query('DELETE FROM mats WHERE id=$1', [req.params.matId]);
     broadcastToTournament(mat.tournament_id, { type: 'mat_deleted', mat_id: req.params.matId });
     res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// ─────────────────────────────────────────────
+// AFFECTATION ARBITRE À UN TAPIS
+// ─────────────────────────────────────────────
+
+// Affecter / désaffecter un arbitre sur un tapis
+app.put('/api/mats/:matId/referee', verifyToken, async (req, res) => {
+  try {
+    const matR = await pool.query('SELECT * FROM mats WHERE id=$1', [req.params.matId]);
+    if (!matR.rows.length) return res.status(404).json({ error: 'Tapis introuvable' });
+    const mat = matR.rows[0];
+
+    if (!await hasTournamentRole(req.user.userId, mat.tournament_id, ['tournament_admin', 'mat_manager'])) {
+      return res.status(403).json({ error: 'Accès refusé' });
+    }
+
+    // Bloquer si un combat est en cours sur ce tapis
+    const activeR = await pool.query(
+      `SELECT COUNT(*) as cnt FROM match_queue WHERE mat_id=$1 AND status='on_mat'`,
+      [req.params.matId]
+    );
+    if (parseInt(activeR.rows[0].cnt) > 0) {
+      return res.status(409).json({ error: 'Un combat est en cours — impossible de changer l\'arbitre maintenant' });
+    }
+
+    const { referee_id } = req.body; // null = désaffecter
+    const r = await pool.query(
+      `UPDATE mats SET referee_id=$1, updated_at=now() WHERE id=$2 RETURNING *`,
+      [referee_id || null, req.params.matId]
+    );
+
+    broadcastToTournament(mat.tournament_id, { type: 'mat_referee_changed', mat_id: req.params.matId, referee_id: referee_id || null });
+    res.json(r.rows[0]);
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// Récupérer le tapis affecté à l'arbitre connecté (pour le redirect post-login)
+app.get('/api/users/me/referee-mat', verifyToken, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT m.id as mat_id, m.name as mat_name, m.tournament_id, t.name as tournament_name, t.slug as tournament_slug
+       FROM mats m
+       JOIN tournaments t ON t.id = m.tournament_id
+       WHERE m.referee_id = $1
+       LIMIT 1`,
+      [req.user.userId]
+    );
+    res.json(r.rows[0] || null);
   } catch (e) {
     res.status(500).json({ error: 'Erreur serveur' });
   }
@@ -1882,6 +1942,12 @@ wss.on('connection', (ws, req) => {
 // ─────────────────────────────────────────────
 // START
 // ─────────────────────────────────────────────
+
+// ─────────────────────────────────────────────
+// MIGRATIONS IDEMPOTENTES AU DÉMARRAGE
+// ─────────────────────────────────────────────
+pool.query(`ALTER TABLE mats ADD COLUMN IF NOT EXISTS referee_id UUID REFERENCES users(id) ON DELETE SET NULL`)
+  .catch(e => console.warn('Migration mats.referee_id:', e.message));
 
 server.listen(PORT, () => {
   console.log(`🏆 Lutte API démarrée sur le port ${PORT}`);
