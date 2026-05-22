@@ -483,7 +483,7 @@ app.put('/api/mats/:matId', verifyToken, async (req, res) => {
 
     params.push(req.params.matId);
     const r = await pool.query(
-      `UPDATE mats SET ${updates.join(',')},updated_at=now() WHERE id=$${params.length} RETURNING *`,
+      `UPDATE mats SET ${updates.join(',')} WHERE id=$${params.length} RETURNING *`,
       params
     );
     res.json(r.rows[0]);
@@ -556,7 +556,7 @@ app.put('/api/mats/:matId/referee', verifyToken, async (req, res) => {
 
     const { referee_id } = req.body; // null = désaffecter
     const r = await pool.query(
-      `UPDATE mats SET referee_id=$1, updated_at=now() WHERE id=$2 RETURNING *`,
+      `UPDATE mats SET referee_id=$1 WHERE id=$2 RETURNING *`,
       [referee_id || null, req.params.matId]
     );
 
