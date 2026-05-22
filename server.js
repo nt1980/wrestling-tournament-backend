@@ -1237,6 +1237,40 @@ app.put('/api/queue/:queueId/unassign', verifyToken, async (req, res) => {
   }
 });
 
+// Promouvoir un combat ready → on_mat (lancer le prochain combat sur le tapis)
+app.put('/api/queue/:queueId/promote', verifyToken, async (req, res) => {
+  try {
+    const qR = await pool.query('SELECT * FROM match_queue WHERE id=$1', [req.params.queueId]);
+    if (!qR.rows.length) return res.status(404).json({ error: 'Introuvable' });
+    const q = qR.rows[0];
+    if (!await hasTournamentRole(req.user.userId, q.tournament_id, ['tournament_admin', 'mat_manager'])) {
+      return res.status(403).json({ error: 'Accès refusé' });
+    }
+    if (q.status !== 'ready') return res.status(409).json({ error: 'Ce combat n\'est pas en attente' });
+    if (!q.mat_id) return res.status(409).json({ error: 'Ce combat n\'est pas affecté à un tapis' });
+    // Vérifier qu'aucun autre combat n'est déjà on_mat sur ce tapis
+    const busy = await pool.query(
+      `SELECT COUNT(*) as cnt FROM match_queue WHERE mat_id=$1 AND status='on_mat'`,
+      [q.mat_id]
+    );
+    if (parseInt(busy.rows[0].cnt) > 0) {
+      return res.status(409).json({ error: 'Un combat est déjà en cours sur ce tapis' });
+    }
+    const r = await pool.query(
+      `UPDATE match_queue SET status='on_mat',updated_at=now() WHERE id=$1 RETURNING *`,
+      [req.params.queueId]
+    );
+    await pool.query(
+      `UPDATE matches SET status='on_mat',mat_id=$1,updated_at=now() WHERE id=$2`,
+      [q.mat_id, q.match_id]
+    );
+    broadcastToTournament(q.tournament_id, { type: 'match_promoted', queue: r.rows[0] });
+    res.json(r.rows[0]);
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
 // Confirmer / infirmer un combat dans la file d'un tapis
 app.put('/api/queue/:queueId/confirm', verifyToken, async (req, res) => {
   try {
