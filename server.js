@@ -1198,7 +1198,7 @@ app.put('/api/queue/:queueId/assign-mat', verifyToken, async (req, res) => {
     const newStatus = parseInt(busy.rows[0].cnt) > 0 ? 'ready' : 'on_mat';
 
     const r = await pool.query(
-      `UPDATE match_queue SET mat_id=$1,status=$2,updated_at=now() WHERE id=$3 RETURNING *`,
+      `UPDATE match_queue SET mat_id=$1,status=$2,confirmed=false,updated_at=now() WHERE id=$3 RETURNING *`,
       [mat_id, newStatus, req.params.queueId]
     );
     await pool.query(
@@ -1222,12 +1222,8 @@ app.put('/api/queue/:queueId/unassign', verifyToken, async (req, res) => {
     if (!await hasTournamentRole(req.user.userId, q.tournament_id, ['tournament_admin', 'mat_manager'])) {
       return res.status(403).json({ error: 'Accès refusé' });
     }
-    if (q.status === 'on_mat') {
-      return res.status(409).json({ error: 'Ce combat est en cours — impossible de le désaffecter' });
-    }
-
     await pool.query(
-      `UPDATE match_queue SET mat_id=NULL,status='ready',updated_at=now() WHERE id=$1`,
+      `UPDATE match_queue SET mat_id=NULL,status='ready',confirmed=false,updated_at=now() WHERE id=$1`,
       [req.params.queueId]
     );
     await pool.query(
@@ -1241,14 +1237,98 @@ app.put('/api/queue/:queueId/unassign', verifyToken, async (req, res) => {
   }
 });
 
+// Confirmer / infirmer un combat dans la file d'un tapis
+app.put('/api/queue/:queueId/confirm', verifyToken, async (req, res) => {
+  try {
+    await pool.query(`ALTER TABLE match_queue ADD COLUMN IF NOT EXISTS confirmed boolean DEFAULT false`).catch(() => {});
+    const qR = await pool.query('SELECT * FROM match_queue WHERE id=$1', [req.params.queueId]);
+    if (!qR.rows.length) return res.status(404).json({ error: 'Introuvable' });
+    const q = qR.rows[0];
+    if (!await hasTournamentRole(req.user.userId, q.tournament_id, ['tournament_admin', 'mat_manager'])) {
+      return res.status(403).json({ error: 'Accès refusé' });
+    }
+    const newConfirmed = !(q.confirmed === true);
+    const r = await pool.query(
+      `UPDATE match_queue SET confirmed=$1,updated_at=now() WHERE id=$2 RETURNING *`,
+      [newConfirmed, req.params.queueId]
+    );
+    broadcastToTournament(q.tournament_id, { type: 'queue_confirmed', queue: r.rows[0] });
+    res.json(r.rows[0]);
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// Réordonner la file de combats
+app.put('/api/tournaments/:id/queue/reorder', verifyToken, async (req, res) => {
+  try {
+    if (!await hasTournamentRole(req.user.userId, req.params.id, ['tournament_admin', 'mat_manager'])) {
+      return res.status(403).json({ error: 'Accès refusé' });
+    }
+    const { items } = req.body; // [{id, position}]
+    if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'items requis' });
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (const item of items) {
+        await client.query(
+          `UPDATE match_queue SET position=$1,updated_at=now() WHERE id=$2 AND tournament_id=$3`,
+          [item.position, item.id, req.params.id]
+        );
+      }
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+    broadcastToTournament(req.params.id, { type: 'queue_reordered' });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// Score live (broadcast WebSocket en cours de combat)
+app.put('/api/matches/:matchId/live-score', verifyToken, async (req, res) => {
+  try {
+    const { score_red, score_blue } = req.body;
+    const mR = await pool.query('SELECT * FROM matches WHERE id=$1', [req.params.matchId]);
+    if (!mR.rows.length) return res.status(404).json({ error: 'Match introuvable' });
+    const match = mR.rows[0];
+    if (!await hasTournamentRole(req.user.userId, match.tournament_id, ['tournament_admin', 'referee', 'mat_manager'])) {
+      return res.status(403).json({ error: 'Accès refusé' });
+    }
+    await pool.query(
+      `UPDATE matches SET score_red=$1,score_blue=$2,updated_at=now() WHERE id=$3`,
+      [score_red ?? 0, score_blue ?? 0, req.params.matchId]
+    );
+    broadcastToTournament(match.tournament_id, {
+      type: 'score_update',
+      match_id: req.params.matchId,
+      score_red: score_red ?? 0,
+      score_blue: score_blue ?? 0,
+    });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
 // ─────────────────────────────────────────────
 // VUE TAPIS (public)
 // ─────────────────────────────────────────────
 
 app.get('/api/mats/:matId/live', async (req, res) => {
   try {
+    await pool.query(`ALTER TABLE match_queue ADD COLUMN IF NOT EXISTS confirmed boolean DEFAULT false`).catch(() => {});
+    const matInfo = await pool.query('SELECT tournament_id,name FROM mats WHERE id=$1', [req.params.matId]);
+    const tournament_id = matInfo.rows[0]?.tournament_id ?? null;
+    const mat_name      = matInfo.rows[0]?.name ?? null;
+
     const current = await pool.query(
-      `SELECT m.*,mq.position,
+      `SELECT m.*,mq.id as queue_id,mq.position,
         r.first_name||' '||r.last_name as red_name, rc.short_name as red_club,
         b.first_name||' '||b.last_name as blue_name, bc.short_name as blue_club,
         comp.style,comp.age_category,comp.weight_category,comp.gender
@@ -1261,8 +1341,9 @@ app.get('/api/mats/:matId/live', async (req, res) => {
        ORDER BY mq.position LIMIT 1`,
       [req.params.matId]
     );
+    // Prochains combats : uniquement ceux confirmés par le responsable tapis
     const next = await pool.query(
-      `SELECT m.*,mq.position,
+      `SELECT m.*,mq.id as queue_id,mq.position,mq.confirmed,
         r.first_name||' '||r.last_name as red_name,
         b.first_name||' '||b.last_name as blue_name,
         comp.style,comp.age_category,comp.weight_category
@@ -1271,11 +1352,11 @@ app.get('/api/mats/:matId/live', async (req, res) => {
        LEFT JOIN athletes r ON r.id=m.red_athlete_id
        LEFT JOIN athletes b ON b.id=m.blue_athlete_id
        LEFT JOIN competitions comp ON comp.id=m.competition_id
-       WHERE mq.mat_id=$1 AND mq.status='ready'
+       WHERE mq.mat_id=$1 AND mq.status='ready' AND mq.confirmed=true
        ORDER BY mq.position LIMIT 3`,
       [req.params.matId]
     );
-    res.json({ current: current.rows[0] || null, next: next.rows });
+    res.json({ current: current.rows[0] || null, next: next.rows, tournament_id, mat_name });
   } catch (e) {
     res.status(500).json({ error: 'Erreur serveur' });
   }
