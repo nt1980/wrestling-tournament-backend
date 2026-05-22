@@ -1437,6 +1437,97 @@ app.post('/api/competitions/:compId/generate-bracket', verifyToken, async (req, 
 });
 
 // ─────────────────────────────────────────────
+// DELETE BRACKET — tableau d'une compétition
+// ─────────────────────────────────────────────
+
+app.delete('/api/competitions/:compId/bracket', verifyToken, async (req, res) => {
+  try {
+    const { compId } = req.params;
+    const compR = await pool.query('SELECT * FROM competitions WHERE id=$1', [compId]);
+    if (!compR.rows.length) return res.status(404).json({ error: 'Compétition introuvable' });
+    const comp = compR.rows[0];
+
+    if (!await hasTournamentRole(req.user.userId, comp.tournament_id, ['tournament_admin'])) {
+      return res.status(403).json({ error: 'Accès refusé' });
+    }
+
+    // Bloquer si un combat est en cours ou terminé
+    const blockedR = await pool.query(
+      `SELECT COUNT(*) as cnt FROM matches WHERE competition_id=$1 AND status IN ('on_mat','finished')`,
+      [compId]
+    );
+    if (parseInt(blockedR.rows[0].cnt) > 0) {
+      return res.status(409).json({ error: 'Des combats sont en cours ou terminés — impossible de supprimer ce tableau' });
+    }
+
+    await pool.query('DELETE FROM repechage_matches WHERE repechage_bracket_id IN (SELECT id FROM repechage_brackets WHERE competition_id=$1)', [compId]);
+    await pool.query('DELETE FROM repechage_brackets WHERE competition_id=$1', [compId]);
+    await pool.query('DELETE FROM match_queue WHERE match_id IN (SELECT id FROM matches WHERE competition_id=$1)', [compId]);
+    await pool.query('DELETE FROM pool_athletes WHERE pool_id IN (SELECT id FROM pools WHERE competition_id=$1)', [compId]);
+    await pool.query('DELETE FROM matches WHERE competition_id=$1', [compId]);
+    await pool.query('DELETE FROM pools WHERE competition_id=$1', [compId]);
+
+    await audit(comp.tournament_id, req.user.userId, 'DELETE_BRACKET', 'competition', compId, null, { weight_category: comp.weight_category, age_category: comp.age_category, style: comp.style });
+    broadcastToTournament(comp.tournament_id, { type: 'bracket_deleted', competition_id: compId });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('Delete bracket error:', e);
+    res.status(500).json({ error: e.message || 'Erreur suppression tableau' });
+  }
+});
+
+// ─────────────────────────────────────────────
+// DELETE BRACKETS BULK — tous les tableaux d'une catégorie d'âge
+// ─────────────────────────────────────────────
+
+app.delete('/api/tournaments/:id/brackets', verifyToken, async (req, res) => {
+  try {
+    const tournamentId = req.params.id;
+    const { age_category } = req.query;
+
+    if (!await hasTournamentRole(req.user.userId, tournamentId, ['tournament_admin'])) {
+      return res.status(403).json({ error: 'Accès refusé' });
+    }
+
+    // Récupérer les compétitions concernées
+    let compsQuery = 'SELECT id, weight_category, age_category, style FROM competitions WHERE tournament_id=$1';
+    const params = [tournamentId];
+    if (age_category) {
+      params.push(age_category);
+      compsQuery += ` AND age_category=$${params.length}`;
+    }
+    const compsR = await pool.query(compsQuery, params);
+    const compIds = compsR.rows.map(c => c.id);
+    if (compIds.length === 0) return res.status(404).json({ error: 'Aucune compétition trouvée' });
+
+    // Bloquer si un combat est en cours ou terminé dans la sélection
+    const blockedR = await pool.query(
+      `SELECT COUNT(*) as cnt FROM matches WHERE competition_id = ANY($1::uuid[]) AND status IN ('on_mat','finished')`,
+      [compIds]
+    );
+    if (parseInt(blockedR.rows[0].cnt) > 0) {
+      return res.status(409).json({ error: `Des combats sont en cours ou terminés dans cette sélection — impossible de supprimer ces tableaux` });
+    }
+
+    for (const compId of compIds) {
+      await pool.query('DELETE FROM repechage_matches WHERE repechage_bracket_id IN (SELECT id FROM repechage_brackets WHERE competition_id=$1)', [compId]);
+      await pool.query('DELETE FROM repechage_brackets WHERE competition_id=$1', [compId]);
+      await pool.query('DELETE FROM match_queue WHERE match_id IN (SELECT id FROM matches WHERE competition_id=$1)', [compId]);
+      await pool.query('DELETE FROM pool_athletes WHERE pool_id IN (SELECT id FROM pools WHERE competition_id=$1)', [compId]);
+      await pool.query('DELETE FROM matches WHERE competition_id=$1', [compId]);
+      await pool.query('DELETE FROM pools WHERE competition_id=$1', [compId]);
+    }
+
+    await audit(tournamentId, req.user.userId, 'DELETE_BRACKETS_BULK', 'tournament', tournamentId, null, { age_category: age_category || 'all', count: compIds.length });
+    broadcastToTournament(tournamentId, { type: 'brackets_deleted', age_category: age_category || null, count: compIds.length });
+    res.json({ ok: true, deleted: compIds.length });
+  } catch (e) {
+    console.error('Delete brackets bulk error:', e);
+    res.status(500).json({ error: e.message || 'Erreur suppression tableaux' });
+  }
+});
+
+// ─────────────────────────────────────────────
 // RANKINGS
 // ─────────────────────────────────────────────
 
