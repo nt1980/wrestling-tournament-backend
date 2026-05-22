@@ -361,9 +361,10 @@ app.put('/api/tournaments/:id', verifyToken, async (req, res) => {
 
 app.get('/api/tournaments/:id/users', verifyToken, async (req, res) => {
   try {
-    if (!await hasTournamentRole(req.user.userId, req.params.id, ['tournament_admin'])) return res.status(403).json({ error: 'Accès refusé' });
+    // mat_manager et tournament_admin peuvent voir la liste des utilisateurs du tournoi
+    if (!await hasTournamentRole(req.user.userId, req.params.id, ['tournament_admin', 'mat_manager'])) return res.status(403).json({ error: 'Accès refusé' });
     const r = await pool.query(
-      'SELECT tu.*,u.name,u.email FROM tournament_users tu JOIN users u ON u.id=tu.user_id WHERE tu.tournament_id=$1 ORDER BY u.name',
+      'SELECT tu.*, u.name AS user_name, u.email AS user_email FROM tournament_users tu JOIN users u ON u.id=tu.user_id WHERE tu.tournament_id=$1 ORDER BY u.name',
       [req.params.id]
     );
     res.json(r.rows);
