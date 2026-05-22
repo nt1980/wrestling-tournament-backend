@@ -461,12 +461,23 @@ app.put('/api/mats/:matId', verifyToken, async (req, res) => {
     if (!await hasTournamentRole(req.user.userId, mat.tournament_id, ['tournament_admin', 'mat_manager'])) {
       return res.status(403).json({ error: 'Accès refusé' });
     }
-    const { name } = req.body;
-    if (!name || !name.trim()) return res.status(400).json({ error: 'Nom requis' });
 
+    const { name, is_active } = req.body;
+    if (name !== undefined && !name.trim()) return res.status(400).json({ error: 'Nom invalide' });
+
+    // Ajouter la colonne is_active si elle n'existe pas encore
+    await pool.query(`ALTER TABLE mats ADD COLUMN IF NOT EXISTS is_active boolean DEFAULT true`).catch(() => {});
+
+    const updates = [];
+    const params = [];
+    if (name !== undefined) { params.push(name.trim()); updates.push(`name=$${params.length}`); }
+    if (is_active !== undefined) { params.push(is_active); updates.push(`is_active=$${params.length}`); }
+    if (updates.length === 0) return res.status(400).json({ error: 'Aucune donnée à mettre à jour' });
+
+    params.push(req.params.matId);
     const r = await pool.query(
-      `UPDATE mats SET name=$1,updated_at=now() WHERE id=$2 RETURNING *`,
-      [name.trim(), req.params.matId]
+      `UPDATE mats SET ${updates.join(',')},updated_at=now() WHERE id=$${params.length} RETURNING *`,
+      params
     );
     res.json(r.rows[0]);
   } catch (e) {
