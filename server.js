@@ -1451,13 +1451,17 @@ app.delete('/api/competitions/:compId/bracket', verifyToken, async (req, res) =>
       return res.status(403).json({ error: 'Accès refusé' });
     }
 
-    // Bloquer si un combat est en cours ou terminé
-    const blockedR = await pool.query(
-      `SELECT COUNT(*) as cnt FROM matches WHERE competition_id=$1 AND status IN ('on_mat','finished')`,
-      [compId]
-    );
-    if (parseInt(blockedR.rows[0].cnt) > 0) {
-      return res.status(409).json({ error: 'Des combats sont en cours ou terminés — impossible de supprimer ce tableau' });
+    // force=true uniquement pour super_admin : ignore les combats déjà joués
+    const forceDelete = req.query.force === 'true' && await isSuperAdmin(req.user.userId);
+
+    if (!forceDelete) {
+      const blockedR = await pool.query(
+        `SELECT COUNT(*) as cnt FROM matches WHERE competition_id=$1 AND status IN ('on_mat','finished')`,
+        [compId]
+      );
+      if (parseInt(blockedR.rows[0].cnt) > 0) {
+        return res.status(409).json({ error: 'Des combats sont en cours ou terminés — impossible de supprimer ce tableau' });
+      }
     }
 
     await pool.query('DELETE FROM repechage_matches WHERE repechage_bracket_id IN (SELECT id FROM repechage_brackets WHERE competition_id=$1)', [compId]);
@@ -1489,6 +1493,9 @@ app.delete('/api/tournaments/:id/brackets', verifyToken, async (req, res) => {
       return res.status(403).json({ error: 'Accès refusé' });
     }
 
+    // force=true uniquement pour super_admin
+    const forceDelete = req.query.force === 'true' && await isSuperAdmin(req.user.userId);
+
     // Récupérer les compétitions concernées
     let compsQuery = 'SELECT id, weight_category, age_category, style FROM competitions WHERE tournament_id=$1';
     const params = [tournamentId];
@@ -1500,13 +1507,15 @@ app.delete('/api/tournaments/:id/brackets', verifyToken, async (req, res) => {
     const compIds = compsR.rows.map(c => c.id);
     if (compIds.length === 0) return res.status(404).json({ error: 'Aucune compétition trouvée' });
 
-    // Bloquer si un combat est en cours ou terminé dans la sélection
-    const blockedR = await pool.query(
-      `SELECT COUNT(*) as cnt FROM matches WHERE competition_id = ANY($1::uuid[]) AND status IN ('on_mat','finished')`,
-      [compIds]
-    );
-    if (parseInt(blockedR.rows[0].cnt) > 0) {
-      return res.status(409).json({ error: `Des combats sont en cours ou terminés dans cette sélection — impossible de supprimer ces tableaux` });
+    if (!forceDelete) {
+      // Bloquer si un combat est en cours ou terminé dans la sélection
+      const blockedR = await pool.query(
+        `SELECT COUNT(*) as cnt FROM matches WHERE competition_id = ANY($1::uuid[]) AND status IN ('on_mat','finished')`,
+        [compIds]
+      );
+      if (parseInt(blockedR.rows[0].cnt) > 0) {
+        return res.status(409).json({ error: `Des combats sont en cours ou terminés dans cette sélection — impossible de supprimer ces tableaux` });
+      }
     }
 
     for (const compId of compIds) {
