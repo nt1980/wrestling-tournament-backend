@@ -330,7 +330,8 @@ app.put('/api/tournaments/:id', verifyToken, async (req, res) => {
     if (!await hasTournamentRole(req.user.userId, id, ['tournament_admin'])) return res.status(403).json({ error: 'Accès refusé' });
     const { name, event_date, city, organizer_club_id, status, number_of_mats,
       public_page_enabled, public_program_enabled, public_results_enabled,
-      public_live_matches_enabled, public_rankings_enabled, repechage_mode } = req.body;
+      public_live_matches_enabled, public_rankings_enabled, repechage_mode,
+      min_rest_minutes } = req.body;
 
     const r = await pool.query(
       `UPDATE tournaments SET
@@ -343,11 +344,13 @@ app.put('/api/tournaments/:id', verifyToken, async (req, res) => {
         public_live_matches_enabled=COALESCE($10,public_live_matches_enabled),
         public_rankings_enabled=COALESCE($11,public_rankings_enabled),
         repechage_mode=COALESCE($12,repechage_mode),
+        min_rest_minutes=COALESCE($13,min_rest_minutes),
         updated_at=now()
-      WHERE id=$13 RETURNING *`,
+      WHERE id=$14 RETURNING *`,
       [name, event_date, city, organizer_club_id, status, number_of_mats,
        public_page_enabled, public_program_enabled, public_results_enabled,
-       public_live_matches_enabled, public_rankings_enabled, repechage_mode, id]
+       public_live_matches_enabled, public_rankings_enabled, repechage_mode,
+       min_rest_minutes != null ? parseInt(min_rest_minutes) : null, id]
     );
     res.json(r.rows[0]);
   } catch (e) {
@@ -1238,7 +1241,17 @@ app.get('/api/tournaments/:id/queue', async (req, res) => {
         b.first_name||' '||b.last_name as blue_name, bc.short_name as blue_club,
         mt.name as mat_name,
         p.name as pool_name,
-        comp.style,comp.age_category,comp.weight_category,comp.gender,comp.format_type
+        comp.style,comp.age_category,comp.weight_category,comp.gender,comp.format_type,
+        (SELECT MAX(m2.ended_at) FROM matches m2
+          WHERE m2.tournament_id=mq.tournament_id AND m2.status='finished'
+          AND m2.ended_at IS NOT NULL AND m2.id != mq.match_id
+          AND (m2.red_athlete_id=m.red_athlete_id OR m2.blue_athlete_id=m.red_athlete_id)
+        ) AS red_last_fight_at,
+        (SELECT MAX(m2.ended_at) FROM matches m2
+          WHERE m2.tournament_id=mq.tournament_id AND m2.status='finished'
+          AND m2.ended_at IS NOT NULL AND m2.id != mq.match_id
+          AND (m2.red_athlete_id=m.blue_athlete_id OR m2.blue_athlete_id=m.blue_athlete_id)
+        ) AS blue_last_fight_at
        FROM match_queue mq
        JOIN matches m ON m.id=mq.match_id
        LEFT JOIN athletes r ON r.id=m.red_athlete_id
@@ -1960,6 +1973,9 @@ wss.on('connection', (ws, req) => {
 // ─────────────────────────────────────────────
 pool.query(`ALTER TABLE mats ADD COLUMN IF NOT EXISTS referee_id UUID REFERENCES users(id) ON DELETE SET NULL`)
   .catch(e => console.warn('Migration mats.referee_id:', e.message));
+
+pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS min_rest_minutes INT NOT NULL DEFAULT 5`)
+  .catch(e => console.warn('Migration tournaments.min_rest_minutes:', e.message));
 
 // Allow 'MX' (mixte) gender for young age categories in competitions
 pool.query(`
