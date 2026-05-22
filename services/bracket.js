@@ -715,33 +715,24 @@ function seedAthletes(athletes, bracketSize) {
 
 /**
  * Build seeding positions for a bracket of given size.
- * Standard bracket seeding: 1 at top, 2 at bottom, 3/4 at quarter boundaries, etc.
+ * Standard bracket seeding: seed 1 and seed 2 can only meet in the final,
+ * seeds 1/4 and 2/3 can only meet in the semis, etc.
+ *
+ * Recursive approach: split bracket in half, interleave sub-results
+ * so that top-half seeds are at even slots and bottom-half mirrors at odd slots.
+ * Terminates in O(n log n) for any power-of-2 size.
  */
 function buildSeedPositions(size) {
-  let positions = [0, size - 1];
-  while (positions.length < size) {
-    const next = [];
-    const quarter = size / (positions.length * 2);
-    for (const p of positions) {
-      // The "mirror" position in the opposite sub-bracket of the same section
-      const mirror = p < size / 2
-        ? p + Math.floor(size / positions.length) - 1
-        : p - Math.floor(size / positions.length) + 1;
-      next.push(p);
-      next.push(clamp(mirror, 0, size - 1));
-    }
-    positions = [...new Set(next)].slice(0, positions.length * 2);
+  if (size <= 1) return [0];
+  if (size === 2) return [0, 1];
+  const half = size / 2;
+  const sub = buildSeedPositions(half);
+  const result = new Array(size);
+  for (let i = 0; i < half; i++) {
+    result[i * 2]     = sub[i];              // odd seeds  → top half
+    result[i * 2 + 1] = size - 1 - sub[i];  // even seeds → bottom half (mirror)
   }
-
-  // Fallback: just return 0..size-1 if something went wrong
-  if (positions.length !== size) {
-    return Array.from({ length: size }, (_, i) => i);
-  }
-  return positions;
-}
-
-function clamp(v, min, max) {
-  return Math.max(min, Math.min(max, v));
+  return result;
 }
 
 /**
