@@ -543,6 +543,25 @@ export async function generateBracket(
     }
 
     // ---------------------------------------------------------------------------
+    // Propagate BYE winners to next-round slots
+    // ---------------------------------------------------------------------------
+    // BYE matches are pre-generated as finished. Populate the corresponding
+    // slot in round 1 so athletes appear immediately without manual processing.
+    if (numRounds >= 2) {
+      const byeMatches = bracketMatches.filter(
+        m => m.is_bye && m.winner_id && m.round === 0
+      );
+      for (const byeMatch of byeMatches) {
+        const nextRoundIdx = Math.floor(byeMatch.index_in_round / 2);
+        const nextSlot = matchGrid[1]?.[nextRoundIdx];
+        if (!nextSlot) continue;
+        // Even index → red slot of next match; odd index → blue slot
+        const col = byeMatch.index_in_round % 2 === 0 ? 'red_athlete_id' : 'blue_athlete_id';
+        await patchMatch(client, nextSlot.id, { [col]: byeMatch.winner_id });
+      }
+    }
+
+    // ---------------------------------------------------------------------------
     // Repechage brackets
     // ---------------------------------------------------------------------------
     // Standard wrestling repechage: the two finalists' brackets.
