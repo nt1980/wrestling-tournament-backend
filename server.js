@@ -1070,12 +1070,18 @@ app.post('/api/tournaments/:id/competitions/generate', verifyToken, async (req, 
       params
     );
 
-    // Grouper par style+gender+age_category+weight_category
+    // Catégories d'âge "mixtes" : le sexe n'est pas pris en compte dans le regroupement
+    const MIXED_AGE_CATS = new Set(['U5', 'U7', 'U9', 'U11']);
+
+    // Grouper par style + gender + age_category + weight_category
+    // Pour U5/U7/U9/U11 : gender = 'MX' (mixte) — les M et F concourent ensemble
     const groups = {};
     for (const reg of regs.rows) {
       const style = reg.final_style || reg.style;
-      const key = `${style}|${reg.gender}|${reg.final_age_category}|${reg.final_weight_category}`;
-      if (!groups[key]) groups[key] = { style, gender: reg.gender, age_category: reg.final_age_category, weight_category: reg.final_weight_category, athletes: [] };
+      const isMixed = MIXED_AGE_CATS.has(reg.final_age_category);
+      const genderKey = isMixed ? 'MX' : (reg.gender || 'M');
+      const key = `${style}|${genderKey}|${reg.final_age_category}|${reg.final_weight_category}`;
+      if (!groups[key]) groups[key] = { style, gender: genderKey, age_category: reg.final_age_category, weight_category: reg.final_weight_category, athletes: [] };
       groups[key].athletes.push(reg);
     }
 
@@ -1948,6 +1954,26 @@ wss.on('connection', (ws, req) => {
 // ─────────────────────────────────────────────
 pool.query(`ALTER TABLE mats ADD COLUMN IF NOT EXISTS referee_id UUID REFERENCES users(id) ON DELETE SET NULL`)
   .catch(e => console.warn('Migration mats.referee_id:', e.message));
+
+// Allow 'MX' (mixte) gender for young age categories in competitions
+pool.query(`
+  DO $do$
+  DECLARE cname text;
+  BEGIN
+    SELECT conname INTO cname
+    FROM pg_constraint
+    WHERE conrelid = 'competitions'::regclass
+      AND contype = 'c'
+      AND pg_get_constraintdef(oid) LIKE '%gender%'
+    LIMIT 1;
+    IF cname IS NOT NULL THEN
+      EXECUTE 'ALTER TABLE competitions DROP CONSTRAINT ' || cname;
+    END IF;
+    ALTER TABLE competitions ADD CONSTRAINT competitions_gender_check
+      CHECK (gender IN ('M', 'F', 'MX'));
+  EXCEPTION WHEN duplicate_object THEN NULL;
+  END $do$
+`).catch(e => console.warn('Migration competitions.gender MX:', e.message));
 
 server.listen(PORT, () => {
   console.log(`🏆 Lutte API démarrée sur le port ${PORT}`);
