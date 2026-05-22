@@ -439,12 +439,74 @@ app.post('/api/tournaments/:id/mats', verifyToken, async (req, res) => {
   try {
     if (!await hasTournamentRole(req.user.userId, req.params.id, ['tournament_admin', 'mat_manager'])) return res.status(403).json({ error: 'Accès refusé' });
     const { name } = req.body;
-    const slug = generateSlug(name);
+    if (!name || !name.trim()) return res.status(400).json({ error: 'Nom requis' });
+    const slug = generateSlug(`${name}-${Date.now()}`);
     const r = await pool.query(
       'INSERT INTO mats(id,tournament_id,name,slug) VALUES($1,$2,$3,$4) RETURNING *',
-      [uuidv4(), req.params.id, name, slug]
+      [uuidv4(), req.params.id, name.trim(), slug]
     );
     res.status(201).json(r.rows[0]);
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// Renommer un tapis
+app.put('/api/mats/:matId', verifyToken, async (req, res) => {
+  try {
+    const matR = await pool.query('SELECT * FROM mats WHERE id=$1', [req.params.matId]);
+    if (!matR.rows.length) return res.status(404).json({ error: 'Tapis introuvable' });
+    const mat = matR.rows[0];
+
+    if (!await hasTournamentRole(req.user.userId, mat.tournament_id, ['tournament_admin', 'mat_manager'])) {
+      return res.status(403).json({ error: 'Accès refusé' });
+    }
+    const { name } = req.body;
+    if (!name || !name.trim()) return res.status(400).json({ error: 'Nom requis' });
+
+    const r = await pool.query(
+      `UPDATE mats SET name=$1,updated_at=now() WHERE id=$2 RETURNING *`,
+      [name.trim(), req.params.matId]
+    );
+    res.json(r.rows[0]);
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// Supprimer un tapis
+app.delete('/api/mats/:matId', verifyToken, async (req, res) => {
+  try {
+    const matR = await pool.query('SELECT * FROM mats WHERE id=$1', [req.params.matId]);
+    if (!matR.rows.length) return res.status(404).json({ error: 'Tapis introuvable' });
+    const mat = matR.rows[0];
+
+    if (!await hasTournamentRole(req.user.userId, mat.tournament_id, ['tournament_admin'])) {
+      return res.status(403).json({ error: 'Accès refusé' });
+    }
+
+    // Bloquer si combat on_mat sur ce tapis
+    const activeR = await pool.query(
+      `SELECT COUNT(*) as cnt FROM match_queue WHERE mat_id=$1 AND status='on_mat'`,
+      [req.params.matId]
+    );
+    if (parseInt(activeR.rows[0].cnt) > 0) {
+      return res.status(409).json({ error: 'Un combat est en cours sur ce tapis — terminez-le avant de supprimer' });
+    }
+
+    // Désaffecter les combats en attente sur ce tapis → queue globale
+    await pool.query(
+      `UPDATE match_queue SET mat_id=NULL,status='ready',updated_at=now() WHERE mat_id=$1 AND status='ready'`,
+      [req.params.matId]
+    );
+    await pool.query(
+      `UPDATE matches SET mat_id=NULL,status='ready',updated_at=now() WHERE mat_id=$1 AND status='ready'`,
+      [req.params.matId]
+    );
+
+    await pool.query('DELETE FROM mats WHERE id=$1', [req.params.matId]);
+    broadcastToTournament(mat.tournament_id, { type: 'mat_deleted', mat_id: req.params.matId });
+    res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: 'Erreur serveur' });
   }
@@ -1116,13 +1178,53 @@ app.get('/api/tournaments/:id/queue', async (req, res) => {
 app.put('/api/queue/:queueId/assign-mat', verifyToken, async (req, res) => {
   try {
     const { mat_id } = req.body;
-    const r = await pool.query(
-      'UPDATE match_queue SET mat_id=$1,status=\'on_mat\',updated_at=now() WHERE id=$2 RETURNING *',
-      [mat_id, req.params.queueId]
+
+    // Si le tapis a déjà un combat on_mat → pré-file (status=ready + mat_id)
+    const busy = await pool.query(
+      `SELECT COUNT(*) as cnt FROM match_queue WHERE mat_id=$1 AND status='on_mat'`,
+      [mat_id]
     );
-    await pool.query('UPDATE matches SET mat_id=$1,status=\'on_mat\',updated_at=now() WHERE id=$2', [mat_id, r.rows[0].match_id]);
+    const newStatus = parseInt(busy.rows[0].cnt) > 0 ? 'ready' : 'on_mat';
+
+    const r = await pool.query(
+      `UPDATE match_queue SET mat_id=$1,status=$2,updated_at=now() WHERE id=$3 RETURNING *`,
+      [mat_id, newStatus, req.params.queueId]
+    );
+    await pool.query(
+      `UPDATE matches SET mat_id=$1,status=$2,updated_at=now() WHERE id=$3`,
+      [mat_id, newStatus, r.rows[0].match_id]
+    );
     broadcastToTournament(r.rows[0].tournament_id, { type: 'match_assigned', queue: r.rows[0] });
     res.json(r.rows[0]);
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// Désaffecter un combat (le remettre dans la queue globale)
+app.put('/api/queue/:queueId/unassign', verifyToken, async (req, res) => {
+  try {
+    const qR = await pool.query('SELECT * FROM match_queue WHERE id=$1', [req.params.queueId]);
+    if (!qR.rows.length) return res.status(404).json({ error: 'Introuvable' });
+    const q = qR.rows[0];
+
+    if (!await hasTournamentRole(req.user.userId, q.tournament_id, ['tournament_admin', 'mat_manager'])) {
+      return res.status(403).json({ error: 'Accès refusé' });
+    }
+    if (q.status === 'on_mat') {
+      return res.status(409).json({ error: 'Ce combat est en cours — impossible de le désaffecter' });
+    }
+
+    await pool.query(
+      `UPDATE match_queue SET mat_id=NULL,status='ready',updated_at=now() WHERE id=$1`,
+      [req.params.queueId]
+    );
+    await pool.query(
+      `UPDATE matches SET mat_id=NULL,status='ready',updated_at=now() WHERE id=$1`,
+      [q.match_id]
+    );
+    broadcastToTournament(q.tournament_id, { type: 'match_unassigned', queue_id: req.params.queueId });
+    res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: 'Erreur serveur' });
   }
