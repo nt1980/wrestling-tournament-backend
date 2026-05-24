@@ -758,10 +758,11 @@ async function buildUWWRepechage(
         wt[cur.ids[k]] = next.ids[Math.floor(k / 2)];
       }
     } else if (cur.type === 'merge' && next.type === 'cross') {
-      // Mirror: merge[k] → cross[Kc-1-k]
-      const Kc = next.ids.length;
+      // Sequential: merge[k] → cross[k]
+      // On garde le même ordre visuel (pas de croisement de lignes) —
+      // la position dans le tour cross est alignée avec le merge précédent.
       for (let k = 0; k < cur.ids.length; k++) {
-        wt[cur.ids[k]] = next.ids[Kc - 1 - k];
+        wt[cur.ids[k]] = next.ids[k];
       }
     }
   }
