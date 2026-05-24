@@ -815,6 +815,10 @@ async function buildUWWRepechage(
   // Si l'un des deux matchs sources d'un BR est un BYE, le BR lui-même
   // n'aura qu'un seul athlète réel → on le marque is_bye = true.
   // Le serveur auto-avancera cet athlète vers le tour C1 dès qu'il arrive.
+  //
+  // Si les DEUX sources sont des BYE (double-BYE) : le BR n'a aucun athlète,
+  // on marque également le match C1 qu'il alimente en is_bye. Ainsi, quand le
+  // perdant du tableau principal arrive en C1 (seul), il s'auto-avance aussi.
   for (let k = 0; k < brIds.length; k++) {
     const src0 = matchGrid[0][2 * k];
     const src1 = matchGrid[0][2 * k + 1];
@@ -822,6 +826,11 @@ async function buildUWWRepechage(
     const bye1 = !src1 || !!byId[src1?.id]?.is_bye;
     if (bye0 || bye1) {
       await patchMatch(client, brIds[k], { is_bye: true });
+      if (bye0 && bye1) {
+        // Double-BYE : propager le BYE au match C1 correspondant
+        const c1Id = wt[brIds[k]];
+        if (c1Id) await patchMatch(client, c1Id, { is_bye: true });
+      }
     }
   }
 
