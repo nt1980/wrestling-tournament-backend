@@ -1194,10 +1194,21 @@ app.put('/api/matches/:matchId/result', verifyToken, async (req, res) => {
       const nextMatch = await pool.query('SELECT * FROM matches WHERE id=$1', [match.winner_to]);
       if (nextMatch.rows.length) {
         const nm = nextMatch.rows[0];
-        if (!nm.red_athlete_id) {
-          await pool.query('UPDATE matches SET red_athlete_id=$1,updated_at=now() WHERE id=$2', [winner_id, nm.id]);
-        } else if (!nm.blue_athlete_id) {
-          await pool.query('UPDATE matches SET blue_athlete_id=$1,updated_at=now() WHERE id=$2', [winner_id, nm.id]);
+        // Vainqueurs issus du repêchage → slot ROUGE (priorité RED)
+        // pour respecter la règle UWW : vainqueur repêchage = rouge, repeché tableau = bleu.
+        const winnerIsRepechage = ['repechage', 'bronze'].includes(match.bracket);
+        if (winnerIsRepechage) {
+          if (!nm.red_athlete_id) {
+            await pool.query('UPDATE matches SET red_athlete_id=$1,updated_at=now() WHERE id=$2', [winner_id, nm.id]);
+          } else if (!nm.blue_athlete_id) {
+            await pool.query('UPDATE matches SET blue_athlete_id=$1,updated_at=now() WHERE id=$2', [winner_id, nm.id]);
+          }
+        } else {
+          if (!nm.red_athlete_id) {
+            await pool.query('UPDATE matches SET red_athlete_id=$1,updated_at=now() WHERE id=$2', [winner_id, nm.id]);
+          } else if (!nm.blue_athlete_id) {
+            await pool.query('UPDATE matches SET blue_athlete_id=$1,updated_at=now() WHERE id=$2', [winner_id, nm.id]);
+          }
         }
         // Débloquer si les deux participants sont connus
         const updated = await pool.query('SELECT * FROM matches WHERE id=$1', [nm.id]);
@@ -1223,10 +1234,12 @@ app.put('/api/matches/:matchId/result', verifyToken, async (req, res) => {
       const loserNext = await pool.query('SELECT * FROM matches WHERE id=$1', [match.loser_to]);
       if (loserNext.rows.length) {
         const lm = loserNext.rows[0];
-        if (!lm.red_athlete_id) {
-          await pool.query('UPDATE matches SET red_athlete_id=$1,updated_at=now() WHERE id=$2', [effectiveLoserId, lm.id]);
-        } else if (!lm.blue_athlete_id) {
+        // Perdants du tableau principal → slot BLEU dans le tour de repêchage
+        // (règle UWW : repeché tableau final = bleu, vainqueur repêchage = rouge)
+        if (!lm.blue_athlete_id) {
           await pool.query('UPDATE matches SET blue_athlete_id=$1,updated_at=now() WHERE id=$2', [effectiveLoserId, lm.id]);
+        } else if (!lm.red_athlete_id) {
+          await pool.query('UPDATE matches SET red_athlete_id=$1,updated_at=now() WHERE id=$2', [effectiveLoserId, lm.id]);
         }
         // Débloquer le match de repêchage si les deux combattants sont connus
         const updatedLoser = await pool.query('SELECT * FROM matches WHERE id=$1', [lm.id]);
