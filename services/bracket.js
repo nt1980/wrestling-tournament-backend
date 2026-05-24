@@ -562,125 +562,44 @@ export async function generateBracket(
     }
 
     // ---------------------------------------------------------------------------
-    // Repechage brackets
+    // Repechage brackets (UWW unified structure)
     // ---------------------------------------------------------------------------
-    // Standard wrestling repechage: the two finalists' brackets.
-    // Each finalist "owns" a repechage chain: athletes who lost to the finalist
-    // (at any round) compete for bronze.
-    //
-    // For simplified_bronze: single 3rd-place match between the two semi-final losers.
-    // For full_repechage: full repechage bracket from each side.
-    //
-    // We always create repechage_brackets rows for both finalists.
-    // Then we build repechage match placeholders.
-
-    const repechageBrackets = [];
-
-    // Identify the final match
-    const finalMatch = matchGrid[numRounds - 1][0];
-
-    // The two semi-final matches feed the final
-    const semi1Match = numRounds >= 2 ? matchGrid[numRounds - 2][0] : null;
-    const semi2Match = numRounds >= 2 ? matchGrid[numRounds - 2][1] : null;
+    // simplified_bronze : one 3rd-place match between the two semi-final losers.
+    // everything else   : full UWW repechage —
+    //   BR(k)  = PM(2k-1) vs PM(2k)          adjacent first-round losers
+    //   R(k)   = PA(k)    vs VBR(K-k+1)      mirror crossing (K = N/2)
+    //   Merge  = pairs of R winners
+    //   R2(k)  = PB(k)    vs VMerge(K/2-k+1) mirror crossing
+    //   … until 2 final winners = 3e place ex-aequo
 
     if (repechageMode === 'simplified_bronze') {
-      // Just one bronze match between the two semi losers
-      const bronzeId = uuidv4();
+      const bronzeId    = uuidv4();
+      const semi1Match  = numRounds >= 2 ? matchGrid[numRounds - 2][0] : null;
+      const semi2Match  = numRounds >= 2 ? matchGrid[numRounds - 2][1] : null;
       const bronze = await insertMatch(client, {
         id: bronzeId,
         competition_id: competitionId,
-        tournament_id: tournamentId,
-        round: numRounds, // round after final
+        tournament_id:  tournamentId,
+        round: numRounds,
         index_in_round: 0,
-        bracket: 'bronze',
-        phase: 'final',
-        match_type: 'bronze',
+        bracket: 'bronze', phase: 'final', match_type: 'bronze',
         status: 'blocked',
         parent_match_ids: [semi1Match?.id, semi2Match?.id].filter(Boolean),
       });
       bracketMatches.push(bronze);
-
-      // Patch semi-final loser_to → bronze
       if (semi1Match) await patchMatch(client, semi1Match.id, { loser_to: bronzeId });
       if (semi2Match) await patchMatch(client, semi2Match.id, { loser_to: bronzeId });
 
     } else {
-      // Full repechage: create repechage_brackets for each finalist side
-      // and build the repechage ladder.
-
-      for (const side of ['top', 'bottom']) {
-        const rbId = uuidv4();
-        const rbResult = await client.query(
-          `INSERT INTO repechage_brackets
-             (id, competition_id, finalist_side, finalist_id)
-           VALUES ($1, $2, $3, $4) RETURNING *`,
-          [rbId, competitionId, side, null] // finalist_id filled after semis played
-        );
-        repechageBrackets.push(rbResult.rows[0]);
-
-        // Build repechage rounds for this side.
-        // Round structure:
-        //   Level 0: losers from round 0 (first round) who lost to athletes on this side
-        //   Level 1: losers from round 1 who lost to athletes advancing on this side
-        //   ...
-        //   Level numRounds-2: loser of the semi-final on this side → bronze
-        //
-        // For bracket size B with numRounds rounds:
-        //   repechage levels = numRounds - 1 (rounds 0..numRounds-2)
-        //   At each level l, there are 2^(numRounds-2-l) losers feeding in
-        //   and the same number of repechage matches.
-        //
-        // We build the repechage match grid per side and link them up.
-
-        const sideMatchGrid = buildRepechageGrid(side, numRounds, matchGrid);
-
-        // Insert repechage matches
-        for (let level = 0; level < sideMatchGrid.length; level++) {
-          const levelMatches = sideMatchGrid[level];
-          for (let idx = 0; idx < levelMatches.length; idx++) {
-            const slot = levelMatches[idx];
-
-            const isLastLevel = level === sideMatchGrid.length - 1;
-            const rmId = slot.id;
-
-            const repMatch = await insertMatch(client, {
-              id: rmId,
-              competition_id: competitionId,
-              tournament_id: tournamentId,
-              round: numRounds + level,
-              index_in_round: idx,
-              bracket: isLastLevel ? 'bronze' : 'repechage',
-              phase: isLastLevel ? 'final' : 'repechage',
-              match_type: isLastLevel ? 'bronze' : 'repechage',
-              status: 'blocked',
-              parent_match_ids: slot.parentMatchIds,
-              winner_to: slot.winnerTo,
-            });
-            bracketMatches.push(repMatch);
-
-            // Record in repechage_matches table
-            await client.query(
-              `INSERT INTO repechage_matches
-                 (id, repechage_bracket_id, match_id, source_match_ids, level)
-               VALUES ($1, $2, $3, $4, $5)`,
-              [
-                uuidv4(),
-                rbId,
-                rmId,
-                slot.sourceMainMatchIds,
-                level,
-              ]
-            );
-          }
-        }
-
-        // Patch main-bracket matches: loser_to → first repechage match for that loser's slot
-        patchMainBracketLoserTo(client, side, numRounds, matchGrid, sideMatchGrid);
-      }
+      await buildUWWRepechage(
+        client, bracketMatches,
+        competitionId, tournamentId,
+        numRounds, matchGrid
+      );
     }
 
     await client.query('COMMIT');
-    return { bracket_matches: bracketMatches, repechage_brackets: repechageBrackets };
+    return { bracket_matches: bracketMatches, repechage_brackets: [] };
   } catch (err) {
     await client.query('ROLLBACK');
     throw err;
@@ -772,136 +691,133 @@ function buildMatchGrid(bracketSize, numRounds) {
 }
 
 /**
- * Build the repechage match grid for one finalist side.
+ * Build the unified UWW repechage bracket.
  *
- * The structure (for numRounds = 3, bracketSize = 8):
- *   Level 0: 1 match  – the first-round loser on this side
- *   Level 1 (bronze): 1 match – loser feeds in from level 0 winner, other loser is semi loser
+ * Structure for N first-round matches:
  *
- * For numRounds = 4 (bracketSize = 16):
- *   Level 0: 2 matches – first-round losers
- *   Level 1: 2 matches – level-0 winners vs second-round losers
- *   Level 2 (bronze): 1 match – level-1 winners vs semi loser
+ *   BR round  : BRk = PM(2k-1) vs PM(2k)       adjacent first-round losers
+ *   Cross 1   : Rk  = PA(k) vs VBR(K-k+1)      mirror  (K = N/2)
+ *   Merge 1   : pairs of R winners              binary merge
+ *   Cross 2   : R2k = PB(k) vs VM1(K/2-k+1)    mirror
+ *   Merge 2   …
+ *   Cross n   : 2 final matches → 3e place ex-aequo, no small final
  *
- * In general for numRounds rounds, repechage has (numRounds - 1) levels.
- * Level l has 2^(numRounds-2-l) matches.
- *
- * side 'A' corresponds to the left half of the bracket (indices 0..bracketSize/2-1 at round 0)
- * side 'B' corresponds to the right half.
- *
- * Returns array of levels, each level is array of { id, parentMatchIds, winnerTo, sourceMainMatchIds }
+ * Connector logic visible in the frontend:
+ *   BR  → Cross  (same count) : 1-to-1 straight connectors
+ *   Cross → Merge (halved)    : elbow / binary-merge connectors
+ *   Merge → Cross (same count): 1-to-1 straight connectors
  */
-function buildRepechageGrid(side, numRounds, matchGrid) {
-  const numLevels = numRounds - 1; // last level is bronze
-  const grid = [];
+async function buildUWWRepechage(
+  client, bracketMatches,
+  competitionId, tournamentId,
+  numRounds, matchGrid
+) {
+  const N = matchGrid[0].length; // first-round match count = bracketSize / 2
 
-  // Pre-create IDs for all repechage matches
-  for (let level = 0; level < numLevels; level++) {
-    const count = Math.pow(2, numRounds - 2 - level);
-    const row = [];
-    for (let i = 0; i < count; i++) {
-      row.push({
-        id: uuidv4(),
-        parentMatchIds: [],
-        sourceMainMatchIds: [],
-        winnerTo: null,
+  // ── Pre-allocate IDs ──────────────────────────────────────────────────────
+  const brIds = Array.from({ length: N / 2 }, () => uuidv4());
+
+  // repSeq: sequence of rounds after BR
+  // { type: 'cross'|'merge', count, mainRound? (cross only), ids }
+  const repSeq = [];
+  let cur  = N / 2;
+  let mr   = 1; // main-bracket round whose losers enter the next cross
+
+  // First cross: N/2 matches (A-round losers × BR winners, mirror)
+  repSeq.push({ type: 'cross', count: cur, mainRound: mr, ids: Array.from({ length: cur }, () => uuidv4()) });
+  mr++;
+
+  while (cur > 2) {
+    // Merge: halve the winner pool
+    const mc = cur / 2;
+    repSeq.push({ type: 'merge', count: mc, ids: Array.from({ length: mc }, () => uuidv4()) });
+    cur = mc;
+
+    // Cross: merge winners × next main-round losers (mirror)
+    repSeq.push({ type: 'cross', count: cur, mainRound: mr, ids: Array.from({ length: cur }, () => uuidv4()) });
+    mr++;
+  }
+  // Last cross has 2 matches → those 2 winners are 3e place ex-aequo
+
+  // ── Wire winner_to ────────────────────────────────────────────────────────
+  const wt = {}; // id → next-match id
+
+  // BR[k].winnerTo = firstCross[K-1-k]  (mirror)
+  const K = brIds.length;
+  for (let k = 0; k < K; k++) {
+    wt[brIds[k]] = repSeq[0].ids[K - 1 - k];
+  }
+
+  for (let i = 0; i < repSeq.length - 1; i++) {
+    const cur  = repSeq[i];
+    const next = repSeq[i + 1];
+
+    if (cur.type === 'cross' && next.type === 'merge') {
+      // Sequential pairing: (0,1)→0, (2,3)→1, …
+      for (let k = 0; k < cur.ids.length; k++) {
+        wt[cur.ids[k]] = next.ids[Math.floor(k / 2)];
+      }
+    } else if (cur.type === 'merge' && next.type === 'cross') {
+      // Mirror: merge[k] → cross[Kc-1-k]
+      const Kc = next.ids.length;
+      for (let k = 0; k < cur.ids.length; k++) {
+        wt[cur.ids[k]] = next.ids[Kc - 1 - k];
+      }
+    }
+  }
+  // Last cross: winners go nowhere (3e place)
+
+  // ── Insert BR matches ─────────────────────────────────────────────────────
+  for (let k = 0; k < brIds.length; k++) {
+    const m = await insertMatch(client, {
+      id: brIds[k],
+      competition_id: competitionId, tournament_id: tournamentId,
+      round: numRounds, index_in_round: k,
+      bracket: 'repechage', phase: 'repechage', match_type: 'repechage',
+      status: 'blocked', winner_to: wt[brIds[k]] ?? null,
+    });
+    bracketMatches.push(m);
+  }
+
+  // ── Insert repSeq matches ─────────────────────────────────────────────────
+  const lastRi = repSeq.length - 1;
+  for (let ri = 0; ri < repSeq.length; ri++) {
+    const seq      = repSeq[ri];
+    const round    = numRounds + 1 + ri;
+    const isBronze = ri === lastRi && seq.type === 'cross';
+
+    for (let k = 0; k < seq.ids.length; k++) {
+      const m = await insertMatch(client, {
+        id: seq.ids[k],
+        competition_id: competitionId, tournament_id: tournamentId,
+        round, index_in_round: k,
+        bracket:    isBronze ? 'bronze'    : 'repechage',
+        phase:      isBronze ? 'final'     : 'repechage',
+        match_type: isBronze ? 'bronze'    : 'repechage',
+        status: 'blocked', winner_to: wt[seq.ids[k]] ?? null,
       });
-    }
-    grid.push(row);
-  }
-
-  // Wire winner_to within repechage levels
-  for (let level = 0; level < numLevels - 1; level++) {
-    const currentLevel = grid[level];
-    const nextLevel = grid[level + 1];
-    for (let i = 0; i < currentLevel.length; i++) {
-      const nextIdx = Math.floor(i / 2);
-      currentLevel[i].winnerTo = nextLevel[nextIdx].id;
-    }
-  }
-  // Last level winners go nowhere (they are bronze medal winners)
-
-  // Record which main-bracket matches feed into each repechage slot.
-  // At level 0: losers from main bracket round 0 on the given side.
-  // At level l: losers from main bracket round l on the given side
-  //             are injected into the repechage matches at level l.
-  // The side determines which half of round r's matches we use.
-
-  const halfSize = matchGrid[0].length / 2; // matches per side at round 0
-  for (let level = 0; level < numLevels; level++) {
-    const mainRound = level; // losers from this main round join repechage at this level
-    const mainMatchesInRound = matchGrid[mainRound];
-
-    // Which indices belong to this side?
-    // Side A: left half (indices 0 .. halfSize/2^level - 1 ) … actually we need to track
-    // which matches are in the sub-bracket that leads to finalist A.
-    // A simpler model: side A = indices 0..count/2-1, side B = the rest, where count = matchesInRound.length
-    const count = mainMatchesInRound.length;
-    const sideACount = count / 2;
-    const startIdx = side === 'top' ? 0 : sideACount;
-    const endIdx = side === 'top' ? sideACount : count;
-
-    const losersFromThisRound = [];
-    for (let i = startIdx; i < endIdx; i++) {
-      losersFromThisRound.push(mainMatchesInRound[i].id);
-    }
-
-    // At level 0, these losers are the direct inputs.
-    // At level l, they are injected one-per-match alongside the previous winner.
-    const repLevel = grid[level];
-    for (let i = 0; i < repLevel.length; i++) {
-      const mainMatchId = losersFromThisRound[i] ?? null;
-      if (mainMatchId) {
-        repLevel[i].sourceMainMatchIds.push(mainMatchId);
-        repLevel[i].parentMatchIds.push(mainMatchId); // will resolve to loser
-      }
-      // If level > 0, also link the previous level winner
-      if (level > 0) {
-        const prevLevel = grid[level - 1];
-        if (prevLevel[i]) {
-          repLevel[i].parentMatchIds.push(prevLevel[i].id);
-        }
-      }
+      bracketMatches.push(m);
     }
   }
 
-  return grid;
-}
+  // ── Patch main-bracket loser_to ───────────────────────────────────────────
+  // Build a map id → inserted match (to detect BYEs)
+  const byId = {};
+  for (const m of bracketMatches) byId[m.id] = m;
 
-/**
- * Patch main-bracket match loser_to fields to point to the correct repechage match.
- *
- * Loser of main bracket round r, index idx on the given side →
- * repechage level r, index relative to that side.
- *
- * This function fires async but errors are acceptable here as they don't affect
- * match creation (the link is informational for the application layer).
- * In production you'd await this inside the transaction.
- */
-async function patchMainBracketLoserTo(client, side, numRounds, matchGrid, sideRepGrid) {
-  for (let r = 0; r < numRounds - 1; r++) {
-    // Skip the final (no loser_to for finalist)
-    const mainMatchesInRound = matchGrid[r];
-    const count = mainMatchesInRound.length;
-    const sideACount = count / 2;
-    const startIdx = side === 'top' ? 0 : sideACount;
-    const endIdx = side === 'top' ? sideACount : count;
+  // Round 0 losers → BR  (BRk = PM(2k-1) vs PM(2k), i.e. match i → BR[floor(i/2)])
+  for (let i = 0; i < matchGrid[0].length; i++) {
+    if (byId[matchGrid[0][i].id]?.is_bye) continue; // BYE → no real loser
+    await patchMatch(client, matchGrid[0][i].id, { loser_to: brIds[Math.floor(i / 2)] });
+  }
 
-    const repLevel = sideRepGrid[r] ?? null;
-    if (!repLevel) continue;
-
-    let repIdx = 0;
-    for (let i = startIdx; i < endIdx; i++) {
-      const mainMatch = mainMatchesInRound[i];
-      const repMatch = repLevel[repIdx] ?? repLevel[repLevel.length - 1];
-      if (mainMatch && repMatch) {
-        try {
-          await patchMatch(client, mainMatch.id, { loser_to: repMatch.id });
-        } catch {
-          // Non-fatal: proceed
-        }
-      }
-      repIdx++;
+  // Each cross round: A[k]/B[k]/… loser_to = cross[k]  (direct, no mirror on this side)
+  for (const seq of repSeq) {
+    if (seq.type !== 'cross') continue;
+    const mainSlots = matchGrid[seq.mainRound];
+    if (!mainSlots) continue;
+    for (let k = 0; k < mainSlots.length && k < seq.ids.length; k++) {
+      await patchMatch(client, mainSlots[k].id, { loser_to: seq.ids[k] });
     }
   }
 }
