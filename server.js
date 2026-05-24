@@ -2347,25 +2347,10 @@ pool.query(`ALTER TABLE mats ADD COLUMN IF NOT EXISTS referee_id UUID REFERENCES
 pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS min_rest_minutes INT NOT NULL DEFAULT 5`)
   .catch(e => console.warn('Migration tournaments.min_rest_minutes:', e.message));
 
-// Allow 'MX' (mixte) gender for young age categories in competitions
-pool.query(`
-  DO $do$
-  DECLARE cname text;
-  BEGIN
-    SELECT conname INTO cname
-    FROM pg_constraint
-    WHERE conrelid = 'competitions'::regclass
-      AND contype = 'c'
-      AND pg_get_constraintdef(oid) LIKE '%gender%'
-    LIMIT 1;
-    IF cname IS NOT NULL THEN
-      EXECUTE 'ALTER TABLE competitions DROP CONSTRAINT ' || cname;
-    END IF;
-    ALTER TABLE competitions ADD CONSTRAINT competitions_gender_check
-      CHECK (gender IN ('M', 'F', 'MX'));
-  EXCEPTION WHEN duplicate_object THEN NULL;
-  END $do$
-`).catch(e => console.warn('Migration competitions.gender MX:', e.message));
+// Allow 'MX' (mixte) gender for jeunes mixed pools
+// ALTER TYPE ADD VALUE cannot run inside a transaction — must be a top-level statement
+pool.query(`ALTER TYPE gender_type ADD VALUE IF NOT EXISTS 'MX'`)
+  .catch(e => console.warn('Migration gender_type MX:', e.message));
 
 // Jeunes: source column on competitions (standard vs jeunes)
 pool.query(`ALTER TABLE competitions ADD COLUMN IF NOT EXISTS source VARCHAR(20) NOT NULL DEFAULT 'standard'`)
