@@ -1212,6 +1212,35 @@ app.put('/api/matches/:matchId/result', verifyToken, async (req, res) => {
       }
     }
 
+    // ─── Avancer le PERDANT dans le repêchage ───────────────────────────────
+    // loser_id peut ne pas être fourni explicitement : on le déduit du match.
+    const effectiveLoserId = loser_id
+      || (winner_id === match.red_athlete_id  ? match.blue_athlete_id
+        : winner_id === match.blue_athlete_id ? match.red_athlete_id
+        : null);
+
+    if (effectiveLoserId && match.loser_to) {
+      const loserNext = await pool.query('SELECT * FROM matches WHERE id=$1', [match.loser_to]);
+      if (loserNext.rows.length) {
+        const lm = loserNext.rows[0];
+        if (!lm.red_athlete_id) {
+          await pool.query('UPDATE matches SET red_athlete_id=$1,updated_at=now() WHERE id=$2', [effectiveLoserId, lm.id]);
+        } else if (!lm.blue_athlete_id) {
+          await pool.query('UPDATE matches SET blue_athlete_id=$1,updated_at=now() WHERE id=$2', [effectiveLoserId, lm.id]);
+        }
+        // Débloquer le match de repêchage si les deux combattants sont connus
+        const updatedLoser = await pool.query('SELECT * FROM matches WHERE id=$1', [lm.id]);
+        if (updatedLoser.rows[0].red_athlete_id && updatedLoser.rows[0].blue_athlete_id) {
+          await pool.query('UPDATE matches SET status=\'ready\',updated_at=now() WHERE id=$1', [lm.id]);
+          await pool.query(
+            'INSERT INTO match_queue(id,tournament_id,match_id,position,status) SELECT $1,$2,$3,COALESCE((SELECT MAX(position)+1 FROM match_queue WHERE tournament_id=$2),1),\'ready\' WHERE NOT EXISTS(SELECT 1 FROM match_queue WHERE match_id=$3)',
+            [uuidv4(), match.tournament_id, lm.id]
+          );
+        }
+      }
+    }
+    // ────────────────────────────────────────────────────────────────────────
+
     // Mettre à jour queue du match actuel
     await pool.query('UPDATE match_queue SET status=\'finished\',updated_at=now() WHERE match_id=$1', [matchId]);
 
