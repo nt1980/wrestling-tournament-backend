@@ -1241,9 +1241,42 @@ app.put('/api/matches/:matchId/result', verifyToken, async (req, res) => {
         } else if (!lm.red_athlete_id) {
           await pool.query('UPDATE matches SET red_athlete_id=$1,updated_at=now() WHERE id=$2', [effectiveLoserId, lm.id]);
         }
-        // Débloquer le match de repêchage si les deux combattants sont connus
+        // Débloquer ou auto-avancer selon que le match RA est un BYE ou non
         const updatedLoser = await pool.query('SELECT * FROM matches WHERE id=$1', [lm.id]);
-        if (updatedLoser.rows[0].red_athlete_id && updatedLoser.rows[0].blue_athlete_id) {
+        const ulm = updatedLoser.rows[0];
+
+        if (ulm.is_bye) {
+          // Match RA marqué BYE (une source était un BYE) → un seul athlète réel.
+          // On l'auto-avance immédiatement vers le tour C1 (slot ROUGE = position BR winner).
+          const autoWinner = ulm.red_athlete_id || ulm.blue_athlete_id;
+          if (autoWinner && ulm.status !== 'finished') {
+            await pool.query(
+              'UPDATE matches SET status=\'finished\',winner_id=$1,updated_at=now() WHERE id=$2',
+              [autoWinner, ulm.id]
+            );
+            if (ulm.winner_to) {
+              const c1Res = await pool.query('SELECT * FROM matches WHERE id=$1', [ulm.winner_to]);
+              if (c1Res.rows.length) {
+                const c1m = c1Res.rows[0];
+                // Prend le slot ROUGE (rôle du vainqueur BR)
+                if (!c1m.red_athlete_id) {
+                  await pool.query('UPDATE matches SET red_athlete_id=$1,updated_at=now() WHERE id=$2', [autoWinner, c1m.id]);
+                } else if (!c1m.blue_athlete_id) {
+                  await pool.query('UPDATE matches SET blue_athlete_id=$1,updated_at=now() WHERE id=$2', [autoWinner, c1m.id]);
+                }
+                const updC1 = await pool.query('SELECT * FROM matches WHERE id=$1', [c1m.id]);
+                if (updC1.rows[0].red_athlete_id && updC1.rows[0].blue_athlete_id) {
+                  await pool.query('UPDATE matches SET status=\'ready\',updated_at=now() WHERE id=$1', [c1m.id]);
+                  await pool.query(
+                    'INSERT INTO match_queue(id,tournament_id,match_id,position,status) SELECT $1,$2,$3,COALESCE((SELECT MAX(position)+1 FROM match_queue WHERE tournament_id=$2),1),\'ready\' WHERE NOT EXISTS(SELECT 1 FROM match_queue WHERE match_id=$3)',
+                    [uuidv4(), match.tournament_id, c1m.id]
+                  );
+                }
+              }
+            }
+          }
+        } else if (ulm.red_athlete_id && ulm.blue_athlete_id) {
+          // Match RA normal : les deux combattants sont présents, on débloque.
           await pool.query('UPDATE matches SET status=\'ready\',updated_at=now() WHERE id=$1', [lm.id]);
           await pool.query(
             'INSERT INTO match_queue(id,tournament_id,match_id,position,status) SELECT $1,$2,$3,COALESCE((SELECT MAX(position)+1 FROM match_queue WHERE tournament_id=$2),1),\'ready\' WHERE NOT EXISTS(SELECT 1 FROM match_queue WHERE match_id=$3)',

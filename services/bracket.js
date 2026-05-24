@@ -812,6 +812,19 @@ async function buildUWWRepechage(
     await patchMatch(client, matchGrid[0][i].id, { loser_to: brIds[Math.floor(i / 2)] });
   }
 
+  // Si l'un des deux matchs sources d'un BR est un BYE, le BR lui-même
+  // n'aura qu'un seul athlète réel → on le marque is_bye = true.
+  // Le serveur auto-avancera cet athlète vers le tour C1 dès qu'il arrive.
+  for (let k = 0; k < brIds.length; k++) {
+    const src0 = matchGrid[0][2 * k];
+    const src1 = matchGrid[0][2 * k + 1];
+    const bye0 = !src0 || !!byId[src0?.id]?.is_bye;
+    const bye1 = !src1 || !!byId[src1?.id]?.is_bye;
+    if (bye0 || bye1) {
+      await patchMatch(client, brIds[k], { is_bye: true });
+    }
+  }
+
   // Each cross round: A[k]/B[k]/… loser_to = cross[k]  (direct, no mirror on this side)
   for (const seq of repSeq) {
     if (seq.type !== 'cross') continue;
