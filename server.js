@@ -2212,6 +2212,84 @@ app.post('/api/tournaments/:id/jeunes/unassigned/:athleteId/assign', verifyToken
   } catch (e) { console.error(e); res.status(500).json({ error: 'Erreur assignation athlète' }); }
 });
 
+// POST — Créer une poule manuellement depuis les non-assignés
+app.post('/api/tournaments/:id/jeunes/pools', verifyToken, async (req, res) => {
+  try {
+    if (!await hasTournamentRole(req.user.userId, req.params.id, ['tournament_admin']))
+      return res.status(403).json({ error: 'Accès refusé' });
+    const { age_category, athlete_ids = [] } = req.body;
+    if (!age_category) return res.status(400).json({ error: 'age_category requis' });
+    if (!athlete_ids.length) return res.status(400).json({ error: 'Sélectionnez au moins un athlète' });
+
+    // Récupérer les infos des athlètes dans jeunes_unassigned
+    const uR = await pool.query(`
+      SELECT ju.athlete_id, ju.registration_id, ju.weigh_in_weight,
+        a.gender, a.first_name||' '||a.last_name AS name
+      FROM jeunes_unassigned ju
+      JOIN athletes a ON a.id = ju.athlete_id
+      WHERE ju.tournament_id=$1 AND ju.athlete_id=ANY($2::uuid[])
+    `, [req.params.id, athlete_ids]);
+    if (!uR.rows.length) return res.status(404).json({ error: 'Athlètes introuvables dans les non-assignés' });
+    const athData = uR.rows;
+
+    // Déterminer le genre de la poule
+    const genders = [...new Set(athData.map(a => a.gender))];
+    const poolGender = genders.length === 1 ? genders[0] : 'MX';
+
+    // Plage de poids
+    const weights = athData.map(a => Number(a.weigh_in_weight));
+    const wMin = Math.min(...weights);
+    const wMax = Math.max(...weights);
+
+    // Display order
+    const orderR = await pool.query(`SELECT COALESCE(MAX(display_order),0)+1 AS next FROM jeunes_pools WHERE tournament_id=$1`, [req.params.id]);
+    const displayOrder = Number(orderR.rows[0].next);
+
+    // weight_category unique (éviter conflit UNIQUE sur competitions)
+    let wCategory = `${wMin.toFixed(1)}-${wMax.toFixed(1)}`;
+    const dupR = await pool.query(
+      `SELECT 1 FROM competitions WHERE tournament_id=$1 AND source='jeunes' AND weight_category=$2 AND age_category=$3::age_category AND gender=$4::gender_type`,
+      [req.params.id, wCategory, age_category, poolGender]
+    );
+    if (dupR.rows.length) wCategory = `${wCategory} (${displayOrder})`;
+
+    // Création dans une transaction
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const compId = uuidv4();
+      await client.query(`
+        INSERT INTO competitions(id,tournament_id,style,gender,age_category,weight_category,format_type,source)
+        VALUES($1,$2,'libre',$3,$4,$5,'nordic','jeunes')
+      `, [compId, req.params.id, poolGender, age_category, wCategory]);
+
+      const poolId = uuidv4();
+      await client.query(`INSERT INTO pools(id,competition_id,tournament_id,name,status) VALUES($1,$2,$3,$4,'active')`,
+        [poolId, compId, req.params.id, `Poule ${displayOrder}`]);
+
+      for (let i = 0; i < athData.length; i++) {
+        const a = athData[i];
+        await client.query(`INSERT INTO pool_athletes(id,pool_id,athlete_id,seed_order) VALUES($1,$2,$3,$4)`,
+          [uuidv4(), poolId, a.athlete_id, i + 1]);
+        await client.query(`UPDATE tournament_registrations SET competition_id=$1 WHERE id=$2`, [compId, a.registration_id]);
+        await client.query(`DELETE FROM jeunes_unassigned WHERE tournament_id=$1 AND athlete_id=$2`, [req.params.id, a.athlete_id]);
+      }
+
+      const strategyMap = { F: 'girls_first', M: 'boys_only', MX: 'mixed' };
+      await client.query(`
+        INSERT INTO jeunes_pools(id,tournament_id,competition_id,pool_id,age_category,weight_min,weight_max,gender_strategy,display_order)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      `, [uuidv4(), req.params.id, compId, poolId, age_category, wMin, wMax, strategyMap[poolGender] || 'mixed', displayOrder]);
+
+      await client.query('COMMIT');
+    } catch (e) { await client.query('ROLLBACK'); throw e; }
+    finally { client.release(); }
+
+    broadcastToTournament(req.params.id, { type: 'jeunes_updated' });
+    res.json({ ok: true });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'Erreur création poule' }); }
+});
+
 // POST — Générer les matchs d'une poule
 app.post('/api/tournaments/:id/jeunes/pools/:jeunesPoolId/generate-matches', verifyToken, async (req, res) => {
   try {

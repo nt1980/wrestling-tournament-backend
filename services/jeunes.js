@@ -157,8 +157,20 @@ export async function generateJeunesPools(tournamentId, options = {}) {
 // ---------------------------------------------------------------------------
 
 /**
- * Greedy sliding-window pool formation.
- * @param {object[]} athletes  – sorted by weight ASC
+ * Sliding-window pool formation with optimal even splitting.
+ *
+ * Algorithm:
+ *  1. Find the maximum contiguous window starting at i where
+ *     max_weight ≤ min_weight × 1.10  (all within 10 % tolerance).
+ *  2. Split that window evenly into sub-pools of ≤ 4 athletes:
+ *       5 athletes → 3 + 2
+ *       6 athletes → 3 + 3
+ *       7 athletes → 4 + 3
+ *       8 athletes → 4 + 4   etc.
+ *  3. Lone athletes (window of 1) try to join the previous pool;
+ *     otherwise go to unassigned.
+ *
+ * @param {object[]} athletes  – sorted by weight ASC, must have .weight
  * @param {string}   ageCat
  * @param {string}   gender    – 'F' | 'M' | 'MX'
  * @returns {{ pools, unassigned }}
@@ -167,42 +179,43 @@ function _formPools(athletes, ageCat, gender) {
   const pools = [], unassigned = [];
   if (!athletes.length) return { pools, unassigned };
 
-  let cur = [athletes[0]];
+  let i = 0;
+  while (i < athletes.length) {
+    // Find max window where all fit in 10 % tolerance (athletes are sorted ASC)
+    const wBase = +athletes[i].weight;
+    let j = i + 1;
+    while (j < athletes.length && +athletes[j].weight <= wBase * 1.10) j++;
 
-  for (let i = 1; i < athletes.length; i++) {
-    const cand = athletes[i];
-    const test = [...cur, cand];
-    const ws   = test.map(a => +a.weight);
-    const ok   = Math.max(...ws) <= Math.min(...ws) * 1.10 && test.length <= 4;
+    const group = athletes.slice(i, j);
 
-    if (ok) {
-      cur.push(cand);
-    } else {
-      if (cur.length >= 2) pools.push({ athletes: [...cur], ageCat, gender });
-      else                  unassigned.push(...cur);
-      cur = [cand];
-    }
-  }
-
-  // Flush last group
-  if (cur.length >= 2) {
-    pools.push({ athletes: [...cur], ageCat, gender });
-  } else if (cur.length === 1) {
-    // Try to absorb into most recent pool
-    let absorbed = false;
-    for (let pi = pools.length - 1; pi >= 0; pi--) {
-      const p = pools[pi];
-      if (p.athletes.length < 4) {
-        const test = [...p.athletes, cur[0]];
-        const ws   = test.map(a => +a.weight);
-        if (Math.max(...ws) <= Math.min(...ws) * 1.10) {
-          p.athletes.push(cur[0]);
-          absorbed = true;
-          break;
+    if (group.length === 1) {
+      // Single athlete — try to absorb into most recent pool if it has room
+      let absorbed = false;
+      for (let pi = pools.length - 1; pi >= 0; pi--) {
+        const p = pools[pi];
+        if (p.athletes.length < 4) {
+          const ws = [...p.athletes.map(a => +a.weight), +group[0].weight];
+          if (Math.max(...ws) <= Math.min(...ws) * 1.10) {
+            p.athletes.push(group[0]);
+            absorbed = true;
+            break;
+          }
         }
       }
+      if (!absorbed) unassigned.push(...group);
+    } else {
+      // Split group evenly into sub-pools of ≤ 4 — larger pools first
+      const numSub  = Math.ceil(group.length / 4);
+      const base    = Math.floor(group.length / numSub);
+      const extra   = group.length % numSub; // first `extra` pools get +1
+      let start = 0;
+      for (let p = 0; p < numSub; p++) {
+        const size = base + (p < extra ? 1 : 0);
+        pools.push({ athletes: group.slice(start, start + size), ageCat, gender });
+        start += size;
+      }
     }
-    if (!absorbed) unassigned.push(...cur);
+    i = j;
   }
 
   return { pools, unassigned };
