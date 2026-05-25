@@ -308,12 +308,18 @@ app.post('/api/tournaments', verifyToken, async (req, res) => {
       [id, name, slug, event_date, city, organizer_club_id || null, number_of_mats, req.user.userId]
     );
 
-    // Créer les tapis automatiquement
+    // Créer les tapis automatiquement (slug global unique)
     const matNames = 'ABCDEFGHIJKLMNOP'.split('').slice(0, number_of_mats);
     for (const matName of matNames) {
+      const fullName = `Tapis ${matName}`;
+      const baseMatSlug = generateSlug(fullName); // 'tapis-a', 'tapis-b'…
+      let matSlug = baseMatSlug; let msi = 2;
+      while ((await pool.query('SELECT 1 FROM mats WHERE slug=$1', [matSlug])).rowCount > 0) {
+        matSlug = `${baseMatSlug}-${msi++}`;
+      }
       await pool.query(
         'INSERT INTO mats(id,tournament_id,name,slug) VALUES($1,$2,$3,$4)',
-        [uuidv4(), id, `Tapis ${matName}`, `mat-${matName.toLowerCase()}`]
+        [uuidv4(), id, fullName, matSlug]
       );
     }
 
@@ -454,7 +460,13 @@ app.post('/api/tournaments/:id/mats', verifyToken, async (req, res) => {
     if (!await hasTournamentRole(req.user.userId, req.params.id, ['tournament_admin', 'mat_manager'])) return res.status(403).json({ error: 'Accès refusé' });
     const { name } = req.body;
     if (!name || !name.trim()) return res.status(400).json({ error: 'Nom requis' });
-    const slug = generateSlug(`${name}-${Date.now()}`);
+    // Slug from name — globally unique across all tournaments
+    const baseSlug = generateSlug(name.trim()) || 'tapis';
+    let slug = baseSlug;
+    let si = 2;
+    while ((await pool.query('SELECT 1 FROM mats WHERE slug=$1', [slug])).rowCount > 0) {
+      slug = `${baseSlug}-${si++}`;
+    }
     const r = await pool.query(
       'INSERT INTO mats(id,tournament_id,name,slug) VALUES($1,$2,$3,$4) RETURNING *',
       [uuidv4(), req.params.id, name.trim(), slug]
@@ -476,7 +488,7 @@ app.put('/api/mats/:matId', verifyToken, async (req, res) => {
       return res.status(403).json({ error: 'Accès refusé' });
     }
 
-    const { name, is_active } = req.body;
+    const { name, is_active, slug } = req.body;
     if (name !== undefined && !name.trim()) return res.status(400).json({ error: 'Nom invalide' });
 
     // Ajouter la colonne is_active si elle n'existe pas encore
@@ -486,6 +498,15 @@ app.put('/api/mats/:matId', verifyToken, async (req, res) => {
     const params = [];
     if (name !== undefined) { params.push(name.trim()); updates.push(`name=$${params.length}`); }
     if (is_active !== undefined) { params.push(is_active); updates.push(`is_active=$${params.length}`); }
+    if (slug !== undefined) {
+      const cleanSlug = slug.trim().toLowerCase().replace(/[^a-z0-9-]/g, '');
+      if (!cleanSlug || cleanSlug.length < 1 || cleanSlug.length > 50)
+        return res.status(400).json({ error: 'Slug invalide (1-50 caractères, lettres minuscules, chiffres et tirets)' });
+      // Global uniqueness (exclude current mat)
+      const existing = await pool.query('SELECT id FROM mats WHERE slug=$1 AND id!=$2', [cleanSlug, req.params.matId]);
+      if (existing.rowCount > 0) return res.status(409).json({ error: 'Ce slug est déjà utilisé par un autre tapis' });
+      params.push(cleanSlug); updates.push(`slug=$${params.length}`);
+    }
     if (updates.length === 0) return res.status(400).json({ error: 'Aucune donnée à mettre à jour' });
 
     params.push(req.params.matId);
@@ -1518,46 +1539,81 @@ app.put('/api/matches/:matchId/live-score', verifyToken, async (req, res) => {
 // VUE TAPIS (public)
 // ─────────────────────────────────────────────
 
+// ── Helper partagé pour la vue live d'un tapis ──────────────────────────────
+async function _matLiveData(matId) {
+  const matInfo = await pool.query(
+    'SELECT tournament_id, name, slug FROM mats WHERE id=$1',
+    [matId]
+  );
+  if (!matInfo.rows.length) return null;
+  const { tournament_id, name: mat_name, slug: mat_slug } = matInfo.rows[0];
+
+  const tournamentInfo = await pool.query('SELECT slug FROM tournaments WHERE id=$1', [tournament_id]);
+  const tournament_slug = tournamentInfo.rows[0]?.slug ?? null;
+
+  const current = await pool.query(
+    `SELECT m.*,mq.id as queue_id,mq.position,
+      r.first_name||' '||r.last_name as red_name, rc.short_name as red_club,
+      b.first_name||' '||b.last_name as blue_name, bc.short_name as blue_club,
+      comp.style,comp.age_category,comp.weight_category,comp.gender
+     FROM matches m
+     JOIN match_queue mq ON mq.match_id=m.id
+     LEFT JOIN athletes r ON r.id=m.red_athlete_id LEFT JOIN clubs rc ON rc.id=r.club_id
+     LEFT JOIN athletes b ON b.id=m.blue_athlete_id LEFT JOIN clubs bc ON bc.id=b.club_id
+     LEFT JOIN competitions comp ON comp.id=m.competition_id
+     WHERE mq.mat_id=$1 AND mq.status='on_mat'
+     ORDER BY mq.position LIMIT 1`,
+    [matId]
+  );
+  const next = await pool.query(
+    `SELECT m.*,mq.id as queue_id,mq.position,mq.confirmed,
+      r.first_name||' '||r.last_name as red_name,
+      b.first_name||' '||b.last_name as blue_name,
+      comp.style,comp.age_category,comp.weight_category
+     FROM matches m
+     JOIN match_queue mq ON mq.match_id=m.id
+     LEFT JOIN athletes r ON r.id=m.red_athlete_id
+     LEFT JOIN athletes b ON b.id=m.blue_athlete_id
+     LEFT JOIN competitions comp ON comp.id=m.competition_id
+     WHERE mq.mat_id=$1 AND mq.status='ready' AND mq.confirmed=true
+     ORDER BY mq.position LIMIT 3`,
+    [matId]
+  );
+  return { current: current.rows[0] || null, next: next.rows, tournament_id, mat_name, mat_slug, tournament_slug };
+}
+
+// GET /api/mats/:matId/live — accès par UUID (rétro-compatibilité)
 app.get('/api/mats/:matId/live', async (req, res) => {
   try {
-    await pool.query(`ALTER TABLE match_queue ADD COLUMN IF NOT EXISTS confirmed boolean DEFAULT false`).catch(() => {});
-    const matInfo = await pool.query('SELECT tournament_id,name FROM mats WHERE id=$1', [req.params.matId]);
-    const tournament_id = matInfo.rows[0]?.tournament_id ?? null;
-    const mat_name      = matInfo.rows[0]?.name ?? null;
+    const data = await _matLiveData(req.params.matId);
+    if (!data) return res.status(404).json({ error: 'Tapis introuvable' });
+    res.json(data);
+  } catch (e) { res.status(500).json({ error: 'Erreur serveur' }); }
+});
 
-    const current = await pool.query(
-      `SELECT m.*,mq.id as queue_id,mq.position,
-        r.first_name||' '||r.last_name as red_name, rc.short_name as red_club,
-        b.first_name||' '||b.last_name as blue_name, bc.short_name as blue_club,
-        comp.style,comp.age_category,comp.weight_category,comp.gender
-       FROM matches m
-       JOIN match_queue mq ON mq.match_id=m.id
-       LEFT JOIN athletes r ON r.id=m.red_athlete_id LEFT JOIN clubs rc ON rc.id=r.club_id
-       LEFT JOIN athletes b ON b.id=m.blue_athlete_id LEFT JOIN clubs bc ON bc.id=b.club_id
-       LEFT JOIN competitions comp ON comp.id=m.competition_id
-       WHERE mq.mat_id=$1 AND mq.status='on_mat'
-       ORDER BY mq.position LIMIT 1`,
-      [req.params.matId]
+// GET /api/live/:matSlug — accès par slug global (URL simple)
+app.get('/api/live/:matSlug', async (req, res) => {
+  try {
+    const matR = await pool.query('SELECT id FROM mats WHERE slug=$1', [req.params.matSlug]);
+    if (!matR.rows.length) return res.status(404).json({ error: 'Tapis introuvable' });
+    const data = await _matLiveData(matR.rows[0].id);
+    res.json(data);
+  } catch (e) { res.status(500).json({ error: 'Erreur serveur' }); }
+});
+
+// GET /api/live/:tournamentSlug/:matSlug — rétrocompatibilité (accès par slug tournoi + mat)
+app.get('/api/live/:tournamentSlug/:matSlug', async (req, res) => {
+  try {
+    const matR = await pool.query(
+      `SELECT m.id FROM mats m
+       JOIN tournaments t ON t.id = m.tournament_id
+       WHERE t.slug = $1 AND m.slug = $2`,
+      [req.params.tournamentSlug, req.params.matSlug]
     );
-    // Prochains combats : uniquement ceux confirmés par le responsable tapis
-    const next = await pool.query(
-      `SELECT m.*,mq.id as queue_id,mq.position,mq.confirmed,
-        r.first_name||' '||r.last_name as red_name,
-        b.first_name||' '||b.last_name as blue_name,
-        comp.style,comp.age_category,comp.weight_category
-       FROM matches m
-       JOIN match_queue mq ON mq.match_id=m.id
-       LEFT JOIN athletes r ON r.id=m.red_athlete_id
-       LEFT JOIN athletes b ON b.id=m.blue_athlete_id
-       LEFT JOIN competitions comp ON comp.id=m.competition_id
-       WHERE mq.mat_id=$1 AND mq.status='ready' AND mq.confirmed=true
-       ORDER BY mq.position LIMIT 3`,
-      [req.params.matId]
-    );
-    res.json({ current: current.rows[0] || null, next: next.rows, tournament_id, mat_name });
-  } catch (e) {
-    res.status(500).json({ error: 'Erreur serveur' });
-  }
+    if (!matR.rows.length) return res.status(404).json({ error: 'Tapis introuvable' });
+    const data = await _matLiveData(matR.rows[0].id);
+    res.json(data);
+  } catch (e) { res.status(500).json({ error: 'Erreur serveur' }); }
 });
 
 // ─────────────────────────────────────────────
