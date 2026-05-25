@@ -1557,11 +1557,11 @@ async function _matLiveData(matId) {
       b.first_name||' '||b.last_name as blue_name, bc.short_name as blue_club,
       comp.style,comp.age_category,comp.weight_category,comp.gender
      FROM matches m
-     JOIN match_queue mq ON mq.match_id=m.id
+     LEFT JOIN match_queue mq ON mq.match_id=m.id AND mq.mat_id=$1
      LEFT JOIN athletes r ON r.id=m.red_athlete_id LEFT JOIN clubs rc ON rc.id=r.club_id
      LEFT JOIN athletes b ON b.id=m.blue_athlete_id LEFT JOIN clubs bc ON bc.id=b.club_id
      LEFT JOIN competitions comp ON comp.id=m.competition_id
-     WHERE mq.mat_id=$1 AND mq.status='on_mat'
+     WHERE m.mat_id=$1 AND m.status='on_mat'
      ORDER BY mq.position LIMIT 1`,
     [matId]
   );
