@@ -77,12 +77,22 @@ export async function generateJeunesPools(tournamentId, options = {}) {
     let poolsCreated = 0;
     let displayOrder = 1;
 
+    // Per-age-category counters for naming: U9-01, U9-02, U11-01 …
+    const catCounters = {};
+
     if (!reset) {
       const { rows } = await client.query(
         `SELECT COALESCE(MAX(display_order),0) AS m FROM jeunes_pools WHERE tournament_id=$1`,
         [tournamentId]
       );
       displayOrder = Number(rows[0].m) + 1;
+
+      // Seed existing counts per age category
+      const { rows: existing } = await client.query(
+        `SELECT age_category, COUNT(*) AS cnt FROM jeunes_pools WHERE tournament_id=$1 GROUP BY age_category`,
+        [tournamentId]
+      );
+      for (const r of existing) catCounters[r.age_category] = Number(r.cnt);
     }
 
     for (const pg of allPools) {
@@ -91,6 +101,11 @@ export async function generateJeunesPools(tournamentId, options = {}) {
       const ws   = pg.athletes.map(a => +a.weight);
       const wMin = Math.min(...ws);
       const wMax = Math.max(...ws);
+
+      // Per-category sequence number → pool name e.g. U9-01
+      catCounters[pg.ageCat] = (catCounters[pg.ageCat] ?? 0) + 1;
+      const poolSeq = String(catCounters[pg.ageCat]).padStart(2, '0');
+      const poolName = `${pg.ageCat}-${poolSeq}`;
 
       // competition (source = 'jeunes')
       const compId = uuidv4();
@@ -107,7 +122,7 @@ export async function generateJeunesPools(tournamentId, options = {}) {
       await client.query(`
         INSERT INTO pools(id,competition_id,tournament_id,name,status)
         VALUES($1,$2,$3,$4,'active')
-      `, [poolId, compId, tournamentId, `Poule ${displayOrder}`]);
+      `, [poolId, compId, tournamentId, poolName]);
 
       // pool_athletes + registration link
       for (let i = 0; i < pg.athletes.length; i++) {

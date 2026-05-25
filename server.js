@@ -2271,9 +2271,12 @@ app.post('/api/tournaments/:id/jeunes/pools', verifyToken, async (req, res) => {
     const wMin = Math.min(...weights);
     const wMax = Math.max(...weights);
 
-    // Display order
+    // Display order + per-category sequence for naming
     const orderR = await pool.query(`SELECT COALESCE(MAX(display_order),0)+1 AS next FROM jeunes_pools WHERE tournament_id=$1`, [req.params.id]);
     const displayOrder = Number(orderR.rows[0].next);
+    const cntR = await pool.query(`SELECT COUNT(*) AS cnt FROM jeunes_pools WHERE tournament_id=$1 AND age_category=$2`, [req.params.id, age_category]);
+    const poolSeq = String(Number(cntR.rows[0].cnt) + 1).padStart(2, '0');
+    const poolName = `${age_category}-${poolSeq}`;
 
     // weight_category unique (éviter conflit UNIQUE sur competitions)
     let wCategory = `${wMin.toFixed(1)}-${wMax.toFixed(1)}`;
@@ -2295,7 +2298,7 @@ app.post('/api/tournaments/:id/jeunes/pools', verifyToken, async (req, res) => {
 
       const poolId = uuidv4();
       await client.query(`INSERT INTO pools(id,competition_id,tournament_id,name,status) VALUES($1,$2,$3,$4,'active')`,
-        [poolId, compId, req.params.id, `Poule ${displayOrder}`]);
+        [poolId, compId, req.params.id, poolName]);
 
       for (let i = 0; i < athData.length; i++) {
         const a = athData[i];
