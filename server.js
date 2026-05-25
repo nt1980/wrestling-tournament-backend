@@ -310,7 +310,10 @@ app.post('/api/tournaments', verifyToken, async (req, res) => {
     const { name, event_date, city, organizer_club_id, number_of_mats = 1 } = req.body;
     if (!name || !event_date || !city) return res.status(400).json({ error: 'name, event_date, city requis' });
 
-    const baseSlug = generateSlug(`${name}-${city}`);
+    // Slug = ville-année (ex: voiron-2026), sans répéter le nom complet
+    const year = event_date ? new Date(event_date).getFullYear() : '';
+    const slugSource = city ? `${city}${year ? `-${year}` : ''}` : name;
+    const baseSlug = generateSlug(slugSource) || 'tournoi';
     let slug = baseSlug;
     let i = 1;
     while ((await pool.query('SELECT 1 FROM tournaments WHERE slug=$1', [slug])).rowCount > 0) {
@@ -353,7 +356,17 @@ app.put('/api/tournaments/:id', verifyToken, async (req, res) => {
     const { name, event_date, city, organizer_club_id, status, number_of_mats,
       public_page_enabled, public_program_enabled, public_results_enabled,
       public_live_matches_enabled, public_rankings_enabled, repechage_mode,
-      min_rest_minutes, jeunes_weight_tolerance } = req.body;
+      min_rest_minutes, jeunes_weight_tolerance, slug: newSlug } = req.body;
+
+    // Validation et unicité du slug si fourni
+    let validatedSlug = null;
+    if (newSlug !== undefined && newSlug !== null) {
+      const cleanSlug = String(newSlug).trim().toLowerCase().replace(/[^a-z0-9-]/g, '');
+      if (!cleanSlug) return res.status(400).json({ error: 'Slug invalide' });
+      const existing = await pool.query('SELECT id FROM tournaments WHERE slug=$1 AND id!=$2', [cleanSlug, id]);
+      if (existing.rowCount > 0) return res.status(409).json({ error: 'Ce slug est déjà utilisé par un autre tournoi' });
+      validatedSlug = cleanSlug;
+    }
 
     const r = await pool.query(
       `UPDATE tournaments SET
@@ -368,13 +381,15 @@ app.put('/api/tournaments/:id', verifyToken, async (req, res) => {
         repechage_mode=COALESCE($12,repechage_mode),
         min_rest_minutes=COALESCE($13,min_rest_minutes),
         jeunes_weight_tolerance=COALESCE($14,jeunes_weight_tolerance),
+        slug=COALESCE($15,slug),
         updated_at=now()
-      WHERE id=$15 RETURNING *`,
+      WHERE id=$16 RETURNING *`,
       [name, event_date, city, organizer_club_id, status, number_of_mats,
        public_page_enabled, public_program_enabled, public_results_enabled,
        public_live_matches_enabled, public_rankings_enabled, repechage_mode,
        min_rest_minutes != null ? parseInt(min_rest_minutes) : null,
        jeunes_weight_tolerance != null ? parseFloat(jeunes_weight_tolerance) : null,
+       validatedSlug,
        id]
     );
     res.json(r.rows[0]);
