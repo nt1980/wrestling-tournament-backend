@@ -2157,9 +2157,59 @@ app.delete('/api/tournaments/:id/jeunes/pools/:jeunesPoolId/athletes/:athleteId'
         VALUES($1,$2,$3,$4,$5,$6,'manual_removal') ON CONFLICT(registration_id) DO NOTHING
       `, [uuidv4(), req.params.id, tr.id, req.params.athleteId, jp.age_category, tr.weigh_in_weight_kg]);
     }
+    // Recalculer min/max après retrait
+    const wR = await pool.query(`
+      SELECT MIN(tr2.weigh_in_weight_kg::NUMERIC) AS wmin, MAX(tr2.weigh_in_weight_kg::NUMERIC) AS wmax
+      FROM pool_athletes pa2
+      JOIN tournament_registrations tr2 ON tr2.athlete_id=pa2.athlete_id AND tr2.tournament_id=$1
+      WHERE pa2.pool_id=$2
+    `, [req.params.id, jp.pool_id]);
+    if (wR.rows[0].wmin !== null) {
+      await pool.query(`UPDATE jeunes_pools SET weight_min=$1,weight_max=$2,updated_at=now() WHERE id=$3`,
+        [wR.rows[0].wmin, wR.rows[0].wmax, jp.id]);
+    }
     broadcastToTournament(req.params.id, { type: 'jeunes_updated' });
     res.json({ ok: true });
   } catch (e) { console.error(e); res.status(500).json({ error: 'Erreur suppression athlète' }); }
+});
+
+// POST — Assigner un athlète non assigné à une poule existante
+app.post('/api/tournaments/:id/jeunes/unassigned/:athleteId/assign', verifyToken, async (req, res) => {
+  try {
+    if (!await hasTournamentRole(req.user.userId, req.params.id, ['tournament_admin']))
+      return res.status(403).json({ error: 'Accès refusé' });
+    const { jeunes_pool_id } = req.body;
+    const jpR = await pool.query('SELECT * FROM jeunes_pools WHERE id=$1 AND tournament_id=$2', [jeunes_pool_id, req.params.id]);
+    if (!jpR.rows.length) return res.status(404).json({ error: 'Poule introuvable' });
+    const jp = jpR.rows[0];
+    // Vérifier que l'athlète est dans jeunes_unassigned
+    const uR = await pool.query(`SELECT * FROM jeunes_unassigned WHERE tournament_id=$1 AND athlete_id=$2`, [req.params.id, req.params.athleteId]);
+    if (!uR.rows.length) return res.status(404).json({ error: 'Athlète non trouvé dans les non-assignés' });
+    const ua = uR.rows[0];
+    // Calculer le prochain seed_order
+    const seedR = await pool.query(`SELECT COALESCE(MAX(seed_order),0)+1 AS next FROM pool_athletes WHERE pool_id=$1`, [jp.pool_id]);
+    const nextSeed = seedR.rows[0].next;
+    // Ajouter à la poule
+    await pool.query(`INSERT INTO pool_athletes(id,pool_id,athlete_id,seed_order) VALUES($1,$2,$3,$4)`,
+      [uuidv4(), jp.pool_id, req.params.athleteId, nextSeed]);
+    // Lier la registration
+    await pool.query(`UPDATE tournament_registrations SET competition_id=$1 WHERE id=$2`,
+      [jp.competition_id, ua.registration_id]);
+    // Supprimer de jeunes_unassigned
+    await pool.query(`DELETE FROM jeunes_unassigned WHERE tournament_id=$1 AND athlete_id=$2`, [req.params.id, req.params.athleteId]);
+    // Recalculer min/max
+    const wR = await pool.query(`
+      SELECT MIN(tr.weigh_in_weight_kg::NUMERIC) AS wmin, MAX(tr.weigh_in_weight_kg::NUMERIC) AS wmax
+      FROM pool_athletes pa JOIN tournament_registrations tr ON tr.athlete_id=pa.athlete_id AND tr.tournament_id=$1
+      WHERE pa.pool_id=$2
+    `, [req.params.id, jp.pool_id]);
+    if (wR.rows[0].wmin !== null) {
+      await pool.query(`UPDATE jeunes_pools SET weight_min=$1,weight_max=$2,updated_at=now() WHERE id=$3`,
+        [wR.rows[0].wmin, wR.rows[0].wmax, jp.id]);
+    }
+    broadcastToTournament(req.params.id, { type: 'jeunes_updated' });
+    res.json({ ok: true });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'Erreur assignation athlète' }); }
 });
 
 // POST — Générer les matchs d'une poule
