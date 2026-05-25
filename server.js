@@ -332,7 +332,7 @@ app.put('/api/tournaments/:id', verifyToken, async (req, res) => {
     const { name, event_date, city, organizer_club_id, status, number_of_mats,
       public_page_enabled, public_program_enabled, public_results_enabled,
       public_live_matches_enabled, public_rankings_enabled, repechage_mode,
-      min_rest_minutes } = req.body;
+      min_rest_minutes, jeunes_weight_tolerance } = req.body;
 
     const r = await pool.query(
       `UPDATE tournaments SET
@@ -346,12 +346,15 @@ app.put('/api/tournaments/:id', verifyToken, async (req, res) => {
         public_rankings_enabled=COALESCE($11,public_rankings_enabled),
         repechage_mode=COALESCE($12,repechage_mode),
         min_rest_minutes=COALESCE($13,min_rest_minutes),
+        jeunes_weight_tolerance=COALESCE($14,jeunes_weight_tolerance),
         updated_at=now()
-      WHERE id=$14 RETURNING *`,
+      WHERE id=$15 RETURNING *`,
       [name, event_date, city, organizer_club_id, status, number_of_mats,
        public_page_enabled, public_program_enabled, public_results_enabled,
        public_live_matches_enabled, public_rankings_enabled, repechage_mode,
-       min_rest_minutes != null ? parseInt(min_rest_minutes) : null, id]
+       min_rest_minutes != null ? parseInt(min_rest_minutes) : null,
+       jeunes_weight_tolerance != null ? parseFloat(jeunes_weight_tolerance) : null,
+       id]
     );
     res.json(r.rows[0]);
   } catch (e) {
@@ -2085,7 +2088,10 @@ app.post('/api/tournaments/:id/jeunes/generate', verifyToken, async (req, res) =
     if (!await hasTournamentRole(req.user.userId, req.params.id, ['tournament_admin']))
       return res.status(403).json({ error: 'Accès refusé' });
     const { reset = false, age_categories = ['U9', 'U11'] } = req.body;
-    const result = await generateJeunesPools(req.params.id, { reset, age_categories });
+    // Lire la tolérance configurée dans les paramètres du tournoi
+    const tR = await pool.query('SELECT COALESCE(jeunes_weight_tolerance,10.0) AS tol FROM tournaments WHERE id=$1', [req.params.id]);
+    const tolerance = Number(tR.rows[0]?.tol ?? 10.0);
+    const result = await generateJeunesPools(req.params.id, { reset, age_categories, tolerance });
     broadcastToTournament(req.params.id, { type: 'jeunes_updated' });
     res.json(result);
   } catch (e) { console.error(e); res.status(500).json({ error: 'Erreur génération poules jeunes' }); }
@@ -2114,8 +2120,32 @@ app.put('/api/tournaments/:id/jeunes/pools/:jeunesPoolId', verifyToken, async (r
       [mat_id || null, referee_id || null, req.params.jeunesPoolId, req.params.id]
     );
     if (!r.rows.length) return res.status(404).json({ error: 'Poule introuvable' });
+    const jp = r.rows[0];
+
+    // Sync match_queue.mat_id for all ready (not yet started) matches of this pool
+    if (mat_id) {
+      await pool.query(
+        `UPDATE match_queue SET mat_id=$1, updated_at=now()
+         WHERE tournament_id=$2 AND status='ready'
+           AND match_id IN (
+             SELECT id FROM matches WHERE competition_id=$3 AND status != 'finished'
+           )`,
+        [mat_id, req.params.id, jp.competition_id]
+      );
+    } else {
+      // Remove mat from ready matches only (never touch on_mat)
+      await pool.query(
+        `UPDATE match_queue SET mat_id=NULL, updated_at=now()
+         WHERE tournament_id=$1 AND status='ready'
+           AND match_id IN (
+             SELECT id FROM matches WHERE competition_id=$2 AND status != 'finished'
+           )`,
+        [req.params.id, jp.competition_id]
+      );
+    }
+
     broadcastToTournament(req.params.id, { type: 'jeunes_updated' });
-    res.json(r.rows[0]);
+    res.json(jp);
   } catch (e) { console.error(e); res.status(500).json({ error: 'Erreur serveur' }); }
 });
 
@@ -2313,8 +2343,8 @@ app.post('/api/tournaments/:id/jeunes/pools/:jeunesPoolId/generate-matches', ver
     const matches = await generateNordic(jp.competition_id, req.params.id, athletesR.rows, poolRow);
     for (let i = 0; i < matches.length; i++) {
       await pool.query(
-        'INSERT INTO match_queue(id,tournament_id,match_id,position,status) VALUES($1,$2,$3,$4,$5)',
-        [uuidv4(), req.params.id, matches[i].id, i + 1, 'ready']
+        'INSERT INTO match_queue(id,tournament_id,match_id,position,status,mat_id) VALUES($1,$2,$3,$4,$5,$6)',
+        [uuidv4(), req.params.id, matches[i].id, i + 1, 'ready', jp.mat_id || null]
       );
     }
     broadcastToTournament(req.params.id, { type: 'jeunes_updated' });
@@ -2345,8 +2375,8 @@ app.post('/api/tournaments/:id/jeunes/:ageCategory/generate-matches', verifyToke
       const poolRow = (await pool.query('SELECT * FROM pools WHERE id=$1', [jp.pool_id])).rows[0];
       const matches = await generateNordic(jp.competition_id, req.params.id, athletesR.rows, poolRow);
       for (let i = 0; i < matches.length; i++) {
-        await pool.query('INSERT INTO match_queue(id,tournament_id,match_id,position,status) VALUES($1,$2,$3,$4,$5)',
-          [uuidv4(), req.params.id, matches[i].id, i + 1, 'ready']);
+        await pool.query('INSERT INTO match_queue(id,tournament_id,match_id,position,status,mat_id) VALUES($1,$2,$3,$4,$5,$6)',
+          [uuidv4(), req.params.id, matches[i].id, i + 1, 'ready', jp.mat_id || null]);
       }
       totalMatches += matches.length;
     }
@@ -2364,10 +2394,12 @@ app.get('/api/tournaments/:id/jeunes/rankings', async (req, res) => {
     if (age_category) { params.push(age_category); ageFilter = ` AND jp.age_category = $2`; }
     const poolsR = await pool.query(`
       SELECT jp.id AS jeunes_pool_id, jp.age_category, jp.weight_min, jp.weight_max,
-        jp.competition_id, jp.pool_id, c.gender, p.name AS pool_name, jp.display_order
+        jp.competition_id, jp.pool_id, c.gender, p.name AS pool_name, jp.display_order,
+        jp.mat_id, mt.name AS mat_name
       FROM jeunes_pools jp
       JOIN competitions c ON c.id = jp.competition_id
       JOIN pools p ON p.id = jp.pool_id
+      LEFT JOIN mats mt ON mt.id = jp.mat_id
       WHERE jp.tournament_id=$1${ageFilter}
       ORDER BY jp.display_order
     `, params);
@@ -2375,23 +2407,46 @@ app.get('/api/tournaments/:id/jeunes/rankings', async (req, res) => {
     for (const jp of poolsR.rows) {
       const rankings = await computePoolRankings(jp.competition_id, jp.pool_id);
       const matchesR = await pool.query(
-        `SELECT m.*, r.first_name||' '||r.last_name AS red_name, b.first_name||' '||b.last_name AS blue_name,
-          w.first_name||' '||w.last_name AS winner_name
+        `SELECT m.id, m.round, m.position, m.status, m.win_type,
+            m.score_red, m.score_blue, m.red_athlete_id, m.blue_athlete_id, m.winner_id,
+            r.first_name||' '||r.last_name AS red_name,
+            b.first_name||' '||b.last_name AS blue_name,
+            w.first_name||' '||w.last_name AS winner_name,
+            mq.mat_id AS queue_mat_id, mt.name AS queue_mat_name, mq.status AS queue_status
          FROM matches m
-         LEFT JOIN athletes r ON r.id=m.red_athlete_id LEFT JOIN athletes b ON b.id=m.blue_athlete_id
+         LEFT JOIN athletes r ON r.id=m.red_athlete_id
+         LEFT JOIN athletes b ON b.id=m.blue_athlete_id
          LEFT JOIN athletes w ON w.id=m.winner_id
-         WHERE m.competition_id=$1 AND m.is_bye=false ORDER BY m.round,m.position`,
+         LEFT JOIN match_queue mq ON mq.match_id=m.id
+         LEFT JOIN mats mt ON mt.id=mq.mat_id
+         WHERE m.competition_id=$1 AND m.is_bye=false
+         ORDER BY m.round, m.position`,
         [jp.competition_id]
+      );
+      // All pool athletes for complete ranking (even before matches)
+      const athletesR = await pool.query(
+        `SELECT pa.athlete_id, a.first_name||' '||a.last_name AS name,
+            COALESCE(c.short_name, c.name, '—') AS club,
+            tr.weigh_in_weight_kg::NUMERIC(6,2) AS weight
+         FROM pool_athletes pa
+         JOIN athletes a ON a.id=pa.athlete_id
+         LEFT JOIN clubs c ON c.id=a.club_id
+         LEFT JOIN tournament_registrations tr ON tr.athlete_id=pa.athlete_id AND tr.tournament_id=$2
+         WHERE pa.pool_id=$1
+         ORDER BY pa.seed_order`,
+        [jp.pool_id, req.params.id]
       );
       result.push({
         jeunes_pool_id: jp.jeunes_pool_id,
         age_category: jp.age_category,
-        weight_range: `${jp.weight_min}–${jp.weight_max}`,
+        weight_range: `${Number(jp.weight_min).toFixed(1)}–${Number(jp.weight_max).toFixed(1)}`,
         gender: jp.gender,
         pool_name: jp.pool_name,
         display_order: jp.display_order,
+        mat_name: jp.mat_name,
         rankings,
         matches: matchesR.rows,
+        athletes: athletesR.rows,
       });
     }
     res.json(result);
@@ -2474,6 +2529,9 @@ pool.query(`ALTER TABLE mats ADD COLUMN IF NOT EXISTS referee_id UUID REFERENCES
 
 pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS min_rest_minutes INT NOT NULL DEFAULT 5`)
   .catch(e => console.warn('Migration tournaments.min_rest_minutes:', e.message));
+
+pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS jeunes_weight_tolerance NUMERIC(4,1) NOT NULL DEFAULT 10.0`)
+  .catch(e => console.warn('Migration tournaments.jeunes_weight_tolerance:', e.message));
 
 // Allow 'MX' (mixte) gender for jeunes mixed pools
 // ALTER TYPE ADD VALUE cannot run inside a transaction — must be a top-level statement
