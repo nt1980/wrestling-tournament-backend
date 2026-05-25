@@ -1565,6 +1565,41 @@ app.put('/api/matches/:matchId/live-score', verifyToken, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
+// TIMER DU COMBAT
+// ─────────────────────────────────────────────
+
+// PUT /api/matches/:matchId/timer — sync état du chrono + broadcast WebSocket
+app.put('/api/matches/:matchId/timer', verifyToken, async (req, res) => {
+  try {
+    const { timer_state } = req.body;
+    if (!timer_state) return res.status(400).json({ error: 'timer_state requis' });
+
+    const mR = await pool.query('SELECT * FROM matches WHERE id=$1', [req.params.matchId]);
+    if (!mR.rows.length) return res.status(404).json({ error: 'Match introuvable' });
+    const match = mR.rows[0];
+
+    if (!await hasTournamentRole(req.user.userId, match.tournament_id, ['tournament_admin', 'referee', 'mat_manager'])) {
+      return res.status(403).json({ error: 'Accès refusé' });
+    }
+
+    await pool.query(
+      `UPDATE matches SET timer_state=$1, updated_at=now() WHERE id=$2`,
+      [JSON.stringify(timer_state), req.params.matchId]
+    );
+
+    broadcastToTournament(match.tournament_id, {
+      type: 'timer_update',
+      match_id: req.params.matchId,
+      timer_state,
+    });
+
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// ─────────────────────────────────────────────
 // VUE TAPIS (public)
 // ─────────────────────────────────────────────
 
@@ -2708,6 +2743,10 @@ pool.query(`
     UNIQUE(registration_id)
   )
 `).catch(e => console.warn('Migration jeunes_unassigned:', e.message));
+
+// Timer state for matches (JSONB)
+pool.query(`ALTER TABLE matches ADD COLUMN IF NOT EXISTS timer_state JSONB`)
+  .catch(e => console.warn('Migration matches.timer_state:', e.message));
 
 server.listen(PORT, () => {
   console.log(`🏆 Lutte API démarrée sur le port ${PORT}`);
