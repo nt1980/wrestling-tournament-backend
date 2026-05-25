@@ -1591,6 +1591,43 @@ app.get('/api/mats/:matId/live', async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Erreur serveur' }); }
 });
 
+// GET /api/debug/mat/:matSlug — diagnostic v2
+app.get('/api/debug/mat/:matSlug', async (req, res) => {
+  try {
+    const matR = await pool.query('SELECT id, name, slug, tournament_id FROM mats WHERE slug=$1', [req.params.matSlug]);
+    if (!matR.rows.length) return res.json({ error: 'slug introuvable', slug: req.params.matSlug });
+    const mat = matR.rows[0];
+    const tid = mat.tournament_id;
+    const mid = mat.id;
+
+    // Tous les combats du tournoi avec leur statut
+    const matches = await pool.query(
+      `SELECT m.id, m.status, m.mat_id, m.tournament_id,
+              r.first_name||' '||r.last_name as red, b.first_name||' '||b.last_name as blue
+       FROM matches m
+       LEFT JOIN athletes r ON r.id=m.red_athlete_id
+       LEFT JOIN athletes b ON b.id=m.blue_athlete_id
+       WHERE m.tournament_id=$1
+       ORDER BY m.status, m.updated_at DESC LIMIT 20`, [tid]);
+
+    // Toutes les entrées match_queue du tournoi
+    const queue = await pool.query(
+      `SELECT mq.id, mq.match_id, mq.mat_id, mq.status, mq.confirmed,
+              ma.name as mat_name
+       FROM match_queue mq
+       LEFT JOIN mats ma ON ma.id=mq.mat_id
+       WHERE mq.tournament_id=$1
+       ORDER BY mq.status, mq.position LIMIT 20`, [tid]);
+
+    // Combats avec mat_id = ce tapis (toute table matches)
+    const matchesForMat = await pool.query(
+      `SELECT m.id, m.status, m.mat_id FROM matches m WHERE m.mat_id=$1`, [mid]);
+
+    res.json({ mat, mat_uuid: mid, tournament_id: tid,
+      matches_all: matches.rows, queue_all: queue.rows, matches_for_this_mat: matchesForMat.rows });
+  } catch(e) { res.status(500).json({ error: String(e) }); }
+});
+
 // GET /api/live/:matSlug — accès par slug global (URL simple)
 app.get('/api/live/:matSlug', async (req, res) => {
   try {
