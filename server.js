@@ -1591,32 +1591,6 @@ app.get('/api/mats/:matId/live', async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Erreur serveur' }); }
 });
 
-// GET /api/debug/mat/:matSlug — diagnostic (temporaire)
-app.get('/api/debug/mat/:matSlug', async (req, res) => {
-  try {
-    const slug = req.params.matSlug;
-    const matR = await pool.query('SELECT id, name, slug, tournament_id FROM mats WHERE slug=$1', [slug]);
-    if (!matR.rows.length) return res.json({ error: 'Aucun mat avec ce slug', slug });
-    const mat = matR.rows[0];
-
-    const onMatMatches = await pool.query(
-      `SELECT m.id, m.status, m.mat_id, m.red_athlete_id, m.blue_athlete_id
-       FROM matches m WHERE m.mat_id=$1 AND m.status='on_mat'`, [mat.id]);
-
-    const queueEntries = await pool.query(
-      `SELECT mq.id, mq.match_id, mq.mat_id, mq.status, mq.confirmed
-       FROM match_queue mq WHERE mq.mat_id=$1`, [mat.id]);
-
-    const allOnMatInTournament = await pool.query(
-      `SELECT m.id, m.status, m.mat_id, mq.mat_id as q_mat_id, mq.status as q_status
-       FROM matches m
-       LEFT JOIN match_queue mq ON mq.match_id=m.id
-       WHERE m.tournament_id=$1 AND m.status='on_mat'`, [mat.tournament_id]);
-
-    res.json({ mat, onMatMatches: onMatMatches.rows, queueEntries: queueEntries.rows, allOnMatInTournament: allOnMatInTournament.rows });
-  } catch (e) { res.status(500).json({ error: String(e) }); }
-});
-
 // GET /api/live/:matSlug — accès par slug global (URL simple)
 app.get('/api/live/:matSlug', async (req, res) => {
   try {
