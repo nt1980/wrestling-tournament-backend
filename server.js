@@ -2166,6 +2166,39 @@ app.put('/api/tournaments/:id/jeunes/pools/:jeunesPoolId/athletes', verifyToken,
   } catch (e) { console.error(e); res.status(500).json({ error: 'Erreur déplacement athlète' }); }
 });
 
+// Helper — recalculate gender + weight range for a jeunes pool after roster change
+async function _recalcPoolMeta(tournamentId, jp) {
+  // Remaining athletes
+  const statsR = await pool.query(`
+    SELECT a.gender, MIN(tr.weigh_in_weight_kg::NUMERIC) AS wmin, MAX(tr.weigh_in_weight_kg::NUMERIC) AS wmax,
+      COUNT(*) AS cnt
+    FROM pool_athletes pa
+    JOIN athletes a ON a.id = pa.athlete_id
+    JOIN tournament_registrations tr ON tr.athlete_id = pa.athlete_id AND tr.tournament_id=$1
+    WHERE pa.pool_id=$2
+    GROUP BY a.gender
+  `, [tournamentId, jp.pool_id]);
+
+  const cnt = statsR.rows.reduce((s, r) => s + Number(r.cnt), 0);
+  if (cnt === 0) return { athletes_remaining: 0 };
+
+  const genders = [...new Set(statsR.rows.map(r => r.gender))];
+  const newGender = genders.length === 1 ? genders[0] : 'MX';
+  const newStrategy = newGender === 'MX' ? 'mixed' : (newGender === 'F' ? 'girls_first' : 'boys_only');
+  const wmin = Math.min(...statsR.rows.map(r => Number(r.wmin)));
+  const wmax = Math.max(...statsR.rows.map(r => Number(r.wmax)));
+
+  await pool.query(
+    `UPDATE jeunes_pools SET weight_min=$1,weight_max=$2,gender_strategy=$3,updated_at=now() WHERE id=$4`,
+    [wmin, wmax, newStrategy, jp.id]
+  );
+  await pool.query(
+    `UPDATE competitions SET gender=$1::gender_type WHERE id=$2`,
+    [newGender, jp.competition_id]
+  );
+  return { athletes_remaining: cnt };
+}
+
 // DELETE — Retirer un athlète d'une poule → non-assigné
 app.delete('/api/tournaments/:id/jeunes/pools/:jeunesPoolId/athletes/:athleteId', verifyToken, async (req, res) => {
   try {
@@ -2187,20 +2220,40 @@ app.delete('/api/tournaments/:id/jeunes/pools/:jeunesPoolId/athletes/:athleteId'
         VALUES($1,$2,$3,$4,$5,$6,'manual_removal') ON CONFLICT(registration_id) DO NOTHING
       `, [uuidv4(), req.params.id, tr.id, req.params.athleteId, jp.age_category, tr.weigh_in_weight_kg]);
     }
-    // Recalculer min/max après retrait
-    const wR = await pool.query(`
-      SELECT MIN(tr2.weigh_in_weight_kg::NUMERIC) AS wmin, MAX(tr2.weigh_in_weight_kg::NUMERIC) AS wmax
-      FROM pool_athletes pa2
-      JOIN tournament_registrations tr2 ON tr2.athlete_id=pa2.athlete_id AND tr2.tournament_id=$1
-      WHERE pa2.pool_id=$2
-    `, [req.params.id, jp.pool_id]);
-    if (wR.rows[0].wmin !== null) {
-      await pool.query(`UPDATE jeunes_pools SET weight_min=$1,weight_max=$2,updated_at=now() WHERE id=$3`,
-        [wR.rows[0].wmin, wR.rows[0].wmax, jp.id]);
-    }
+    // Recalculer min/max + genre après retrait
+    const meta = await _recalcPoolMeta(req.params.id, jp);
+    broadcastToTournament(req.params.id, { type: 'jeunes_updated' });
+    res.json({ ok: true, athletes_remaining: meta.athletes_remaining });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'Erreur suppression athlète' }); }
+});
+
+// DELETE — Supprimer une poule vide
+app.delete('/api/tournaments/:id/jeunes/pools/:jeunesPoolId', verifyToken, async (req, res) => {
+  try {
+    if (!await hasTournamentRole(req.user.userId, req.params.id, ['tournament_admin']))
+      return res.status(403).json({ error: 'Accès refusé' });
+    const jpR = await pool.query('SELECT * FROM jeunes_pools WHERE id=$1 AND tournament_id=$2', [req.params.jeunesPoolId, req.params.id]);
+    if (!jpR.rows.length) return res.status(404).json({ error: 'Poule introuvable' });
+    const jp = jpR.rows[0];
+
+    // Vérifier qu'il n'y a plus d'athlètes
+    const cntR = await pool.query(`SELECT COUNT(*) AS cnt FROM pool_athletes WHERE pool_id=$1`, [jp.pool_id]);
+    if (Number(cntR.rows[0].cnt) > 0)
+      return res.status(409).json({ error: 'La poule contient encore des athlètes — retirez-les d\'abord' });
+
+    // Supprimer combats & file d'attente liés
+    await pool.query(`DELETE FROM match_queue WHERE match_id IN (SELECT id FROM matches WHERE competition_id=$1)`, [jp.competition_id]);
+    await pool.query(`DELETE FROM matches WHERE competition_id=$1`, [jp.competition_id]);
+    // Supprimer la poule elle-même
+    await pool.query(`DELETE FROM pools WHERE id=$1`, [jp.pool_id]);
+    // Supprimer jeunes_pools
+    await pool.query(`DELETE FROM jeunes_pools WHERE id=$1`, [jp.id]);
+    // Supprimer la compétition
+    await pool.query(`DELETE FROM competitions WHERE id=$1`, [jp.competition_id]);
+
     broadcastToTournament(req.params.id, { type: 'jeunes_updated' });
     res.json({ ok: true });
-  } catch (e) { console.error(e); res.status(500).json({ error: 'Erreur suppression athlète' }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: 'Erreur suppression poule' }); }
 });
 
 // POST — Assigner un athlète non assigné à une poule existante
@@ -2227,16 +2280,8 @@ app.post('/api/tournaments/:id/jeunes/unassigned/:athleteId/assign', verifyToken
       [jp.competition_id, ua.registration_id]);
     // Supprimer de jeunes_unassigned
     await pool.query(`DELETE FROM jeunes_unassigned WHERE tournament_id=$1 AND athlete_id=$2`, [req.params.id, req.params.athleteId]);
-    // Recalculer min/max
-    const wR = await pool.query(`
-      SELECT MIN(tr.weigh_in_weight_kg::NUMERIC) AS wmin, MAX(tr.weigh_in_weight_kg::NUMERIC) AS wmax
-      FROM pool_athletes pa JOIN tournament_registrations tr ON tr.athlete_id=pa.athlete_id AND tr.tournament_id=$1
-      WHERE pa.pool_id=$2
-    `, [req.params.id, jp.pool_id]);
-    if (wR.rows[0].wmin !== null) {
-      await pool.query(`UPDATE jeunes_pools SET weight_min=$1,weight_max=$2,updated_at=now() WHERE id=$3`,
-        [wR.rows[0].wmin, wR.rows[0].wmax, jp.id]);
-    }
+    // Recalculer min/max + genre après ajout
+    await _recalcPoolMeta(req.params.id, jp);
     broadcastToTournament(req.params.id, { type: 'jeunes_updated' });
     res.json({ ok: true });
   } catch (e) { console.error(e); res.status(500).json({ error: 'Erreur assignation athlète' }); }
