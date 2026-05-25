@@ -28,12 +28,11 @@ const pool = new Pool({
 app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '10mb' }));
 
-// ── Résolution slug → UUID pour toutes les routes /api/tournaments/:id ──────
-// Si :id n'est pas un UUID (ex: 'voiron-2026'), on cherche le tournoi par slug
-// et on remplace req.params.id avant que les handlers ne soient appelés.
+// ── Résolution slug → UUID pour toutes les routes avec param :id ────────────
+// app.param() est exécuté avant le handler de la route et ses modifications
+// sur req.params.id sont garanties persistantes pour le handler.
 const UUID_RE_MW = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-app.use('/api/tournaments/:id', async (req, res, next) => {
-  const id = req.params.id;
+app.param('id', async (req, _res, next, id) => {
   if (id && !UUID_RE_MW.test(id)) {
     try {
       const r = await pool.query('SELECT id FROM tournaments WHERE slug=$1', [id]);
