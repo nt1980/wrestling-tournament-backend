@@ -21,7 +21,8 @@ import { v4 as uuidv4 } from 'uuid';
  * @returns {Promise<{pools_created, unassigned_count}>}
  */
 export async function generateJeunesPools(tournamentId, options = {}) {
-  const { reset = false, age_categories = ['U9', 'U11'] } = options;
+  const { reset = false, age_categories = ['U9', 'U11'], tolerance = 10.0 } = options;
+  const tolFactor = 1 + tolerance / 100; // ex. 10 → 1.10
 
   const client = await pool.connect();
   try {
@@ -60,13 +61,13 @@ export async function generateJeunesPools(tournamentId, options = {}) {
       const girls = group.filter(a => a.gender === 'F').sort((a, b) => +a.weight - +b.weight);
       const boys  = group.filter(a => a.gender === 'M').sort((a, b) => +a.weight - +b.weight);
 
-      const girlResult  = _formPools(girls, ageCat, 'F');
-      const boyResult   = _formPools(boys,  ageCat, 'M');
+      const girlResult  = _formPools(girls, ageCat, 'F', tolFactor);
+      const boyResult   = _formPools(boys,  ageCat, 'M', tolFactor);
 
       // Overflow from single-gender passes → try to pair them in mixed pools
       const overflow = [...girlResult.unassigned, ...boyResult.unassigned]
         .sort((a, b) => +a.weight - +b.weight);
-      const mixedResult = _formPools(overflow, ageCat, 'MX');
+      const mixedResult = _formPools(overflow, ageCat, 'MX', tolFactor);
 
       allPools.push(...girlResult.pools, ...boyResult.pools, ...mixedResult.pools);
       allUnassigned.push(...mixedResult.unassigned);
@@ -175,16 +176,16 @@ export async function generateJeunesPools(tournamentId, options = {}) {
  * @param {string}   gender    – 'F' | 'M' | 'MX'
  * @returns {{ pools, unassigned }}
  */
-function _formPools(athletes, ageCat, gender) {
+function _formPools(athletes, ageCat, gender, tolFactor = 1.10) {
   const pools = [], unassigned = [];
   if (!athletes.length) return { pools, unassigned };
 
   let i = 0;
   while (i < athletes.length) {
-    // Find max window where all fit in 10 % tolerance (athletes are sorted ASC)
+    // Find max window where all fit within tolerance (athletes are sorted ASC)
     const wBase = +athletes[i].weight;
     let j = i + 1;
-    while (j < athletes.length && +athletes[j].weight <= wBase * 1.10) j++;
+    while (j < athletes.length && +athletes[j].weight <= wBase * tolFactor) j++;
 
     const group = athletes.slice(i, j);
 
@@ -195,7 +196,7 @@ function _formPools(athletes, ageCat, gender) {
         const p = pools[pi];
         if (p.athletes.length < 4) {
           const ws = [...p.athletes.map(a => +a.weight), +group[0].weight];
-          if (Math.max(...ws) <= Math.min(...ws) * 1.10) {
+          if (Math.max(...ws) <= Math.min(...ws) * tolFactor) {
             p.athletes.push(group[0]);
             absorbed = true;
             break;
