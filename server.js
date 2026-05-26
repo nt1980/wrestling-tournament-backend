@@ -1773,36 +1773,121 @@ app.get('/api/tournaments/:id/programme', async (req, res) => {
 app.get('/api/tournaments/:id/dashboard', verifyToken, async (req, res) => {
   try {
     if (!await canAccessTournament(req.user.userId, req.params.id)) return res.status(403).json({ error: 'Accès refusé' });
-    const [athletes, clubs, comps, matchesTotal, matchesDone, matsActive, weighStats, queueStats] = await Promise.all([
-      pool.query('SELECT COUNT(*) FROM tournament_registrations WHERE tournament_id=$1', [req.params.id]),
-      pool.query('SELECT COUNT(DISTINCT a.club_id) FROM tournament_registrations tr JOIN athletes a ON a.id=tr.athlete_id WHERE tr.tournament_id=$1', [req.params.id]),
-      pool.query('SELECT COUNT(*) FROM competitions WHERE tournament_id=$1', [req.params.id]),
-      pool.query('SELECT COUNT(*) FROM matches WHERE tournament_id=$1 AND is_bye=false', [req.params.id]),
-      pool.query("SELECT COUNT(*) FROM matches WHERE tournament_id=$1 AND status='finished' AND is_bye=false", [req.params.id]),
-      pool.query("SELECT COUNT(*) FROM mats WHERE tournament_id=$1 AND is_active=true", [req.params.id]),
+    const tid = req.params.id;
+
+    const [
+      athletes, clubs, comps, matchesTotal, matchesDone, matsActive,
+      weighStats, queueStats, athletesByAge, matchesByAge, topClubs,
+    ] = await Promise.all([
+      pool.query('SELECT COUNT(*) FROM tournament_registrations WHERE tournament_id=$1', [tid]),
+      pool.query('SELECT COUNT(DISTINCT a.club_id) FROM tournament_registrations tr JOIN athletes a ON a.id=tr.athlete_id WHERE tr.tournament_id=$1', [tid]),
+      pool.query('SELECT COUNT(*) FROM competitions WHERE tournament_id=$1', [tid]),
+      pool.query('SELECT COUNT(*) FROM matches WHERE tournament_id=$1 AND is_bye=false', [tid]),
+      pool.query("SELECT COUNT(*) FROM matches WHERE tournament_id=$1 AND status='finished' AND is_bye=false", [tid]),
+      pool.query("SELECT COUNT(*) FROM mats WHERE tournament_id=$1 AND is_active=true", [tid]),
+
+      // Pesée
       pool.query(`
         SELECT
-          COUNT(*) AS total,
+          COUNT(*)                                                 AS total,
           COUNT(CASE WHEN weigh_in_status='done'       THEN 1 END) AS done,
           COUNT(CASE WHEN weigh_in_status='overweight' THEN 1 END) AS overweight,
           COUNT(CASE WHEN weigh_in_status='no_show'    THEN 1 END) AS no_show,
           COUNT(CASE WHEN weigh_in_status='pending'    THEN 1 END) AS pending
-        FROM tournament_registrations WHERE tournament_id=$1`, [req.params.id]),
+        FROM tournament_registrations WHERE tournament_id=$1`, [tid]),
+
+      // File de tapis
       pool.query(`
         SELECT
           COUNT(CASE WHEN status='on_mat' THEN 1 END) AS on_mat,
           COUNT(CASE WHEN status='ready'  THEN 1 END) AS ready
-        FROM match_queue WHERE tournament_id=$1`, [req.params.id]),
+        FROM match_queue WHERE tournament_id=$1`, [tid]),
+
+      // Participants par catégorie d'âge (depuis les inscriptions)
+      pool.query(`
+        SELECT COALESCE(final_age_category,'?') AS age_category, COUNT(*)::int AS count
+        FROM tournament_registrations
+        WHERE tournament_id=$1
+        GROUP BY final_age_category
+        ORDER BY final_age_category`, [tid]),
+
+      // Combats générés / terminés par catégorie d'âge
+      pool.query(`
+        SELECT comp.age_category,
+               COUNT(*)::int                                          AS total,
+               COUNT(CASE WHEN m.status='finished' THEN 1 END)::int  AS done
+        FROM matches m
+        JOIN competitions comp ON comp.id = m.competition_id
+        WHERE m.tournament_id=$1 AND m.is_bye=false
+        GROUP BY comp.age_category
+        ORDER BY comp.age_category`, [tid]),
+
+      // Top 5 clubs par médailles (or=3pts, argent=2pts, bronze=1pt)
+      pool.query(`
+        WITH medals AS (
+          SELECT cl.id AS club_id, cl.name AS club_name, cl.short_name, 'gold' AS medal
+          FROM matches m
+          JOIN athletes a  ON a.id  = m.winner_id
+          JOIN clubs    cl ON cl.id = a.club_id
+          WHERE m.tournament_id=$1 AND m.status='finished' AND m.match_type='final'
+            AND m.winner_id IS NOT NULL
+          UNION ALL
+          SELECT cl.id, cl.name, cl.short_name, 'silver'
+          FROM matches m
+          JOIN athletes a  ON a.id  = m.loser_id
+          JOIN clubs    cl ON cl.id = a.club_id
+          WHERE m.tournament_id=$1 AND m.status='finished' AND m.match_type='final'
+            AND m.loser_id IS NOT NULL
+          UNION ALL
+          SELECT cl.id, cl.name, cl.short_name, 'bronze'
+          FROM matches m
+          JOIN athletes a  ON a.id  = m.winner_id
+          JOIN clubs    cl ON cl.id = a.club_id
+          WHERE m.tournament_id=$1 AND m.status='finished' AND m.match_type='bronze'
+            AND m.winner_id IS NOT NULL
+        )
+        SELECT club_id, club_name, short_name,
+          COUNT(CASE WHEN medal='gold'   THEN 1 END)::int AS gold,
+          COUNT(CASE WHEN medal='silver' THEN 1 END)::int AS silver,
+          COUNT(CASE WHEN medal='bronze' THEN 1 END)::int AS bronze,
+          (COUNT(CASE WHEN medal='gold'   THEN 1 END)*3 +
+           COUNT(CASE WHEN medal='silver' THEN 1 END)*2 +
+           COUNT(CASE WHEN medal='bronze' THEN 1 END))::int AS points
+        FROM medals
+        GROUP BY club_id, club_name, short_name
+        ORDER BY points DESC, gold DESC, silver DESC, bronze DESC
+        LIMIT 5`, [tid]),
     ]);
+
     const w = weighStats.rows[0];
     const q = queueStats.rows[0];
+
+    const mTotal    = parseInt(matchesTotal.rows[0].count);
+    const mDone     = parseInt(matchesDone.rows[0].count);
+    const mActive   = parseInt(matsActive.rows[0].count);
+    const remaining = mTotal - mDone;
+
+    // ETA : 5 min par combat, divisé par les tapis actifs
+    const AVG_MIN = 5;
+    const etaMinutes = remaining > 0
+      ? Math.ceil(remaining / Math.max(mActive, 1)) * AVG_MIN
+      : 0;
+
+    const clubs_medals = topClubs.rows;
+    const medals_total = {
+      gold:   clubs_medals.reduce((s, c) => s + c.gold,   0),
+      silver: clubs_medals.reduce((s, c) => s + c.silver, 0),
+      bronze: clubs_medals.reduce((s, c) => s + c.bronze, 0),
+    };
+
     res.json({
-      athletes:     parseInt(athletes.rows[0].count),
-      clubs:        parseInt(clubs.rows[0].count),
-      competitions: parseInt(comps.rows[0].count),
-      matches_total: parseInt(matchesTotal.rows[0].count),
-      matches_done:  parseInt(matchesDone.rows[0].count),
-      mats_active:   parseInt(matsActive.rows[0].count),
+      athletes:      parseInt(athletes.rows[0].count),
+      clubs:         parseInt(clubs.rows[0].count),
+      competitions:  parseInt(comps.rows[0].count),
+      matches_total: mTotal,
+      matches_done:  mDone,
+      mats_active:   mActive,
+      eta_minutes:   etaMinutes,
       weigh_in: {
         total:      parseInt(w.total),
         done:       parseInt(w.done),
@@ -1814,8 +1899,13 @@ app.get('/api/tournaments/:id/dashboard', verifyToken, async (req, res) => {
         on_mat: parseInt(q.on_mat),
         ready:  parseInt(q.ready),
       },
+      athletes_by_age: athletesByAge.rows,
+      matches_by_age:  matchesByAge.rows,
+      top_clubs:       clubs_medals,
+      medals_total,
     });
   } catch (e) {
+    console.error('Dashboard error:', e);
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
