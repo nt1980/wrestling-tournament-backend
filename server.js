@@ -1688,7 +1688,7 @@ app.get('/api/live/:tournamentSlug/:matSlug', async (req, res) => {
 
 app.get('/api/tournaments/:id/results', async (req, res) => {
   try {
-    const tournament = await pool.query('SELECT public_results_enabled FROM tournaments WHERE id=$1 OR slug=$1', [req.params.id]);
+    const tournament = await pool.query('SELECT public_results_enabled FROM tournaments WHERE id::text=$1 OR slug=$1', [req.params.id]);
     if (!tournament.rows.length) return res.status(404).json({ error: 'Tournoi introuvable' });
     if (!tournament.rows[0].public_results_enabled) return res.status(403).json({ error: 'Résultats non publics' });
 
@@ -1720,7 +1720,7 @@ app.get('/api/tournaments/:id/results', async (req, res) => {
 app.get('/api/tournaments/:id/programme', async (req, res) => {
   try {
     const t = await pool.query(
-      'SELECT public_page_enabled, public_program_enabled FROM tournaments WHERE id=$1 OR slug=$1',
+      'SELECT public_page_enabled, public_program_enabled FROM tournaments WHERE id::text=$1 OR slug=$1',
       [req.params.id]
     );
     if (!t.rows.length) return res.status(404).json({ error: 'Tournoi introuvable' });
