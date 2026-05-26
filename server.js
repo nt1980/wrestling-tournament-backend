@@ -292,13 +292,15 @@ app.get('/api/tournaments', async (req, res) => {
 
 app.get('/api/tournaments/:id', async (req, res) => {
   try {
+    // Use t.id::text to avoid PostgreSQL UUID cast error when $1 is a slug string
     const r = await pool.query(
-      `SELECT t.*,c.name as organizer_club_name,c.short_name as organizer_club_short,c.logo_url as organizer_logo FROM tournaments t LEFT JOIN clubs c ON c.id=t.organizer_club_id WHERE t.id=$1 OR t.slug=$1`,
+      `SELECT t.*,c.name as organizer_club_name,c.short_name as organizer_club_short,c.logo_url as organizer_logo FROM tournaments t LEFT JOIN clubs c ON c.id=t.organizer_club_id WHERE t.id::text=$1 OR t.slug=$1`,
       [req.params.id]
     );
     if (!r.rows.length) return res.status(404).json({ error: 'Tournoi introuvable' });
     res.json(r.rows[0]);
   } catch (e) {
+    console.error('GET /api/tournaments/:id error:', e.message);
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
@@ -1823,6 +1825,7 @@ app.get('/api/tournaments/:id/dashboard', verifyToken, async (req, res) => {
         ORDER BY comp.age_category`, [tid]),
 
       // Top 5 clubs par médailles (or=3pts, argent=2pts, bronze=1pt)
+      // winner_id est sur matches, loser_id est dans match_results
       pool.query(`
         WITH medals AS (
           SELECT cl.id AS club_id, cl.name AS club_name, cl.short_name, 'gold' AS medal
@@ -1834,10 +1837,11 @@ app.get('/api/tournaments/:id/dashboard', verifyToken, async (req, res) => {
           UNION ALL
           SELECT cl.id, cl.name, cl.short_name, 'silver'
           FROM matches m
-          JOIN athletes a  ON a.id  = m.loser_id
+          JOIN match_results mr ON mr.match_id = m.id
+          JOIN athletes a  ON a.id  = mr.loser_id
           JOIN clubs    cl ON cl.id = a.club_id
           WHERE m.tournament_id=$1 AND m.status='finished' AND m.match_type='final'
-            AND m.loser_id IS NOT NULL
+            AND mr.loser_id IS NOT NULL
           UNION ALL
           SELECT cl.id, cl.name, cl.short_name, 'bronze'
           FROM matches m
