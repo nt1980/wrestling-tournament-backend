@@ -37,7 +37,9 @@ app.param('id', async (req, _res, next, id) => {
     try {
       const r = await pool.query('SELECT id FROM tournaments WHERE slug=$1', [id]);
       if (r.rows.length) req.params.id = r.rows[0].id;
-    } catch (_) {}
+    } catch (e) {
+      console.warn('app.param slug resolution failed:', e.message);
+    }
   }
   next();
 });
