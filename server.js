@@ -941,7 +941,7 @@ app.get('/api/tournaments/:id/registrations', verifyToken, async (req, res) => {
   try {
     if (!await canAccessTournament(req.user.userId, req.params.id)) return res.status(403).json({ error: 'Accès refusé' });
     const r = await pool.query(
-      `SELECT tr.*,a.first_name,a.last_name,a.license_number,a.gender,a.birth_date,a.default_weight_kg,
+      `SELECT tr.*,a.first_name,a.last_name,a.license_number,a.gender,a.birth_date,a.default_weight_kg,a.club_id,
               c.name as club_name,c.short_name as club_short
        FROM tournament_registrations tr
        JOIN athletes a ON a.id=tr.athlete_id
@@ -997,6 +997,53 @@ app.post('/api/tournaments/:id/registrations/import', verifyToken, async (req, r
     res.json({ registered, errors });
   } catch (e) {
     res.status(500).json({ error: 'Erreur import inscriptions' });
+  }
+});
+
+// PUT — modifier catégorie/style + infos athlète d'une inscription
+app.put('/api/tournaments/:id/registrations/:regId', verifyToken, async (req, res) => {
+  try {
+    if (!await hasTournamentRole(req.user.userId, req.params.id, ['tournament_admin', 'weigh_in_manager'])) return res.status(403).json({ error: 'Accès refusé' });
+    const { final_age_category, final_style, final_weight_category,
+            first_name, last_name, gender, license_number, club_id } = req.body;
+
+    // Récupérer l'inscription pour avoir l'athlete_id
+    const regR = await pool.query('SELECT * FROM tournament_registrations WHERE id=$1 AND tournament_id=$2', [req.params.regId, req.params.id]);
+    if (!regR.rowCount) return res.status(404).json({ error: 'Inscription non trouvée' });
+    const reg = regR.rows[0];
+
+    // Mettre à jour l'athlète si des données athlète sont fournies
+    if (first_name || last_name || gender || license_number || club_id !== undefined) {
+      await pool.query(
+        `UPDATE athletes SET
+          first_name = COALESCE($1, first_name),
+          last_name  = COALESCE($2, last_name),
+          gender     = COALESCE($3, gender),
+          license_number = COALESCE($4, license_number),
+          club_id    = COALESCE($5, club_id),
+          updated_at = now()
+        WHERE id=$6`,
+        [first_name || null, last_name || null, gender || null,
+         license_number || null, club_id || null, reg.athlete_id]
+      );
+    }
+
+    // Mettre à jour l'inscription
+    const r = await pool.query(
+      `UPDATE tournament_registrations
+       SET final_age_category  = COALESCE($1, final_age_category),
+           final_style         = COALESCE($2, final_style),
+           final_weight_category = COALESCE($3, final_weight_category),
+           updated_at = now()
+       WHERE id=$4 AND tournament_id=$5
+       RETURNING *`,
+      [final_age_category || null, final_style || null, final_weight_category || null,
+       req.params.regId, req.params.id]
+    );
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error('PUT registration error:', e);
+    res.status(500).json({ error: 'Erreur serveur' });
   }
 });
 
