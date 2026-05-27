@@ -1905,27 +1905,34 @@ app.get('/api/live/:tournamentSlug/:matSlug', async (req, res) => {
 
 app.get('/api/tournaments/:id/results', async (req, res) => {
   try {
-    const tournament = await pool.query('SELECT public_results_enabled FROM tournaments WHERE id::text=$1 OR slug=$1', [req.params.id]);
+    const tournament = await pool.query(
+      'SELECT id, public_results_enabled FROM tournaments WHERE id::text=$1 OR slug=$1',
+      [req.params.id]
+    );
     if (!tournament.rows.length) return res.status(404).json({ error: 'Tournoi introuvable' });
     if (!tournament.rows[0].public_results_enabled) return res.status(403).json({ error: 'Résultats non publics' });
+    const tid = tournament.rows[0].id;
 
     const r = await pool.query(
       `SELECT m.*,
-        r.first_name||' '||r.last_name as red_name, rc.short_name as red_club,
-        b.first_name||' '||b.last_name as blue_name, bc.short_name as blue_club,
-        w.first_name||' '||w.last_name as winner_name,
-        comp.style,comp.age_category,comp.weight_category
+        r.first_name||' '||r.last_name  AS red_name,  rc.short_name AS red_club,
+        b.first_name||' '||b.last_name  AS blue_name, bc.short_name AS blue_club,
+        w.first_name||' '||w.last_name  AS winner_name,
+        lo.first_name||' '||lo.last_name AS loser_name, lc.short_name AS loser_club,
+        comp.style, comp.age_category, comp.weight_category
        FROM matches m
-       LEFT JOIN athletes r ON r.id=m.red_athlete_id LEFT JOIN clubs rc ON rc.id=r.club_id
-       LEFT JOIN athletes b ON b.id=m.blue_athlete_id LEFT JOIN clubs bc ON bc.id=b.club_id
-       LEFT JOIN athletes w ON w.id=m.winner_id
-       LEFT JOIN competitions comp ON comp.id=m.competition_id
-       WHERE m.tournament_id=$1 AND m.status='finished'
+       LEFT JOIN athletes r  ON r.id  = m.red_athlete_id  LEFT JOIN clubs rc ON rc.id = r.club_id
+       LEFT JOIN athletes b  ON b.id  = m.blue_athlete_id LEFT JOIN clubs bc ON bc.id = b.club_id
+       LEFT JOIN athletes w  ON w.id  = m.winner_id
+       LEFT JOIN athletes lo ON lo.id = m.loser_id        LEFT JOIN clubs lc ON lc.id = lo.club_id
+       LEFT JOIN competitions comp ON comp.id = m.competition_id
+       WHERE m.tournament_id=$1 AND m.status='finished' AND m.is_bye=false
        ORDER BY m.ended_at DESC`,
-      [req.params.id]
+      [tid]
     );
     res.json(r.rows);
   } catch (e) {
+    console.error(e);
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
@@ -1937,24 +1944,23 @@ app.get('/api/tournaments/:id/results', async (req, res) => {
 app.get('/api/tournaments/:id/programme', async (req, res) => {
   try {
     const t = await pool.query(
-      'SELECT public_page_enabled, public_program_enabled FROM tournaments WHERE id::text=$1 OR slug=$1',
+      'SELECT id, public_page_enabled, public_program_enabled FROM tournaments WHERE id::text=$1 OR slug=$1',
       [req.params.id]
     );
     if (!t.rows.length) return res.status(404).json({ error: 'Tournoi introuvable' });
     if (!t.rows[0].public_page_enabled || !t.rows[0].public_program_enabled)
       return res.status(403).json({ error: 'Programme non public' });
+    const tid = t.rows[0].id;  // ← UUID réel pour les requêtes SQL
 
     // Competitions
     const comps = await pool.query(
-      `SELECT c.*, COUNT(ca.athlete_id) as athlete_count
+      `SELECT c.*, COUNT(ca.athlete_id) AS athlete_count
        FROM competitions c
-       LEFT JOIN (
-         SELECT DISTINCT athlete_id, competition_id FROM pool_athletes
-       ) ca ON ca.competition_id = c.id
+       LEFT JOIN (SELECT DISTINCT athlete_id, competition_id FROM pool_athletes) ca ON ca.competition_id = c.id
        WHERE c.tournament_id=$1
        GROUP BY c.id
        ORDER BY c.age_category, c.weight_category`,
-      [req.params.id]
+      [tid]
     );
 
     // Pools with athletes
@@ -1965,7 +1971,7 @@ app.get('/api/tournaments/:id/programme', async (req, res) => {
                 'name', a.first_name||' '||a.last_name,
                 'club', COALESCE(cl.short_name, cl.name),
                 'weight', tr.weigh_in_weight_kg
-              ) ORDER BY a.last_name) as athletes
+              ) ORDER BY a.last_name) AS athletes
        FROM pools p
        JOIN competitions c ON c.id = p.competition_id
        LEFT JOIN pool_athletes pa ON pa.pool_id = p.id
@@ -1975,10 +1981,59 @@ app.get('/api/tournaments/:id/programme', async (req, res) => {
        WHERE c.tournament_id = $1
        GROUP BY p.id, c.age_category, c.weight_category, c.style, c.gender
        ORDER BY c.age_category, c.weight_category, p.name`,
-      [req.params.id]
+      [tid]
     );
 
     res.json({ competitions: comps.rows, pools: pools.rows });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// File d'attente publique par tapis (pour la page programme)
+app.get('/api/tournaments/:id/public-queue', async (req, res) => {
+  try {
+    const t = await pool.query(
+      'SELECT id, public_page_enabled FROM tournaments WHERE id::text=$1 OR slug=$1',
+      [req.params.id]
+    );
+    if (!t.rows.length || !t.rows[0].public_page_enabled)
+      return res.status(403).json({ error: 'Non disponible' });
+    const tid = t.rows[0].id;
+
+    const rows = await pool.query(
+      `SELECT mq.id, mq.position, mq.status AS queue_status,
+        mt.id AS mat_id, mt.name AS mat_name,
+        ra.first_name||' '||ra.last_name AS red_name,  rc.short_name AS red_club,
+        ba.first_name||' '||ba.last_name AS blue_name, bc.short_name AS blue_club,
+        comp.age_category, comp.weight_category, comp.style,
+        p.name AS pool_name, m.match_type, m.bracket, m.round,
+        (SELECT MAX(m2.round) FROM matches m2
+          WHERE m2.competition_id = m.competition_id AND m2.bracket IN ('main','final')) AS max_round
+       FROM match_queue mq
+       JOIN mats mt ON mt.id = mq.mat_id
+       JOIN matches m ON m.id = mq.match_id
+       LEFT JOIN athletes ra ON ra.id = m.red_athlete_id  LEFT JOIN clubs rc ON rc.id = ra.club_id
+       LEFT JOIN athletes ba ON ba.id = m.blue_athlete_id LEFT JOIN clubs bc ON bc.id = ba.club_id
+       LEFT JOIN competitions comp ON comp.id = m.competition_id
+       LEFT JOIN pools p ON p.id = m.pool_id
+       WHERE mq.tournament_id=$1 AND mq.status IN ('on_mat','ready') AND mt.is_active=true
+       ORDER BY mt.name,
+         CASE mq.status WHEN 'on_mat' THEN 0 ELSE 1 END,
+         mq.position ASC`,
+      [tid]
+    );
+
+    // Regrouper par tapis
+    const byMat: Record<string, any> = {};
+    for (const row of rows.rows) {
+      if (!byMat[row.mat_id]) byMat[row.mat_id] = { mat_id: row.mat_id, mat_name: row.mat_name, current: null, queue: [] };
+      if (row.queue_status === 'on_mat') byMat[row.mat_id].current = row;
+      else                               byMat[row.mat_id].queue.push(row);
+    }
+
+    res.json(Object.values(byMat));
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Erreur serveur' });
