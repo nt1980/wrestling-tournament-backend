@@ -9,7 +9,7 @@ import { WebSocketServer } from 'ws';
 import { createServer } from 'http';
 import { parse as csvParse } from 'csv-parse/sync';
 import { generateNordic, generatePoolsAndFinals, generateBracket } from './services/bracket.js';
-import { computePoolRankings, computeBracketRankings } from './services/ranking.js';
+import { computePoolRankings, computeBracketRankings, computeJeunesPoolRankings } from './services/ranking.js';
 import { generateJeunesPools, deleteJeunesPools } from './services/jeunes.js';
 
 dotenv.config();
@@ -2584,6 +2584,21 @@ app.post('/api/tournaments/:id/jeunes/generate', verifyToken, async (req, res) =
     if (!await hasTournamentRole(req.user.userId, req.params.id, ['tournament_admin']))
       return res.status(403).json({ error: 'Accès refusé' });
     const { reset = false, age_categories = ['U9', 'U11'] } = req.body;
+
+    // Bloquer la re-génération si des poules existent déjà pour les catégories demandées (sans reset)
+    if (!reset) {
+      const existingR = await pool.query(
+        `SELECT age_category FROM jeunes_pools WHERE tournament_id=$1 AND age_category=ANY($2) LIMIT 1`,
+        [req.params.id, age_categories]
+      );
+      if (existingR.rows.length > 0) {
+        const cats = existingR.rows.map(r => r.age_category).join(', ');
+        return res.status(409).json({
+          error: `Des poules existent déjà pour : ${cats}. Cochez "Supprimer et régénérer" pour les remplacer.`,
+        });
+      }
+    }
+
     // Lire la tolérance configurée dans les paramètres du tournoi
     const tR = await pool.query('SELECT COALESCE(jeunes_weight_tolerance,10.0) AS tol FROM tournaments WHERE id=$1', [req.params.id]);
     const tolerance = Number(tR.rows[0]?.tol ?? 10.0);
@@ -2949,7 +2964,7 @@ app.get('/api/tournaments/:id/jeunes/rankings', async (req, res) => {
     `, params);
     const result = [];
     for (const jp of poolsR.rows) {
-      const rankings = await computePoolRankings(jp.competition_id, jp.pool_id);
+      const rankings = await computeJeunesPoolRankings(jp.competition_id, jp.pool_id);
       const matchesR = await pool.query(
         `SELECT m.id, m.round, m.position, m.status, m.win_type,
             m.score_red, m.score_blue, m.red_athlete_id, m.blue_athlete_id, m.winner_id,
