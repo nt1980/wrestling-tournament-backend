@@ -2962,9 +2962,15 @@ app.get('/api/tournaments/:id/jeunes/rankings', async (req, res) => {
       WHERE jp.tournament_id=$1${ageFilter}
       ORDER BY jp.display_order
     `, params);
+    console.log(`[jeunes/rankings] tournament=${req.params.id} pools=${poolsR.rows.length}`);
     const result = [];
     for (const jp of poolsR.rows) {
-      const rankings = await computeJeunesPoolRankings(jp.competition_id, jp.pool_id);
+      let rankings = [];
+      try {
+        rankings = await computeJeunesPoolRankings(jp.competition_id, jp.pool_id);
+      } catch (rankErr) {
+        console.error(`[jeunes/rankings] ranking error for pool ${jp.pool_id}:`, rankErr.message);
+      }
       const matchesR = await pool.query(
         `SELECT m.id, m.round, m.position, m.status, m.win_type,
             m.score_red, m.score_blue, m.red_athlete_id, m.blue_athlete_id, m.winner_id,
