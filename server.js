@@ -1427,6 +1427,154 @@ app.put('/api/matches/:matchId/result', verifyToken, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
+// ALERTES RÉSULTAT — Signalement / Correction
+// ─────────────────────────────────────────────
+
+// POST /api/matches/:matchId/alert — L'arbitre signale une erreur de résultat
+app.post('/api/matches/:matchId/alert', verifyToken, async (req, res) => {
+  try {
+    const { matchId } = req.params;
+    const matchR = await pool.query('SELECT * FROM matches WHERE id=$1', [matchId]);
+    if (!matchR.rows.length) return res.status(404).json({ error: 'Combat introuvable' });
+    const match = matchR.rows[0];
+
+    // Accès : rôle tournoi OR juge affecté au tapis
+    const hasRole = await hasTournamentRole(req.user.userId, match.tournament_id, ['tournament_admin', 'referee', 'mat_manager']);
+    if (!hasRole) {
+      const matRefR = await pool.query('SELECT id FROM mats WHERE tournament_id=$1 AND referee_id=$2', [match.tournament_id, req.user.userId]);
+      if (!matRefR.rowCount) return res.status(403).json({ error: 'Accès refusé' });
+    }
+
+    const { note } = req.body;
+    const r = await pool.query(
+      `INSERT INTO match_result_alerts(id,match_id,tournament_id,reported_by,note)
+       VALUES($1,$2,$3,$4,$5) RETURNING *`,
+      [uuidv4(), matchId, match.tournament_id, req.user.userId, note || null]
+    );
+    broadcastToTournament(match.tournament_id, { type: 'new_result_alert', alert: r.rows[0] });
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// GET /api/tournaments/:id/alerts — Lister les alertes (pending ou archived)
+app.get('/api/tournaments/:id/alerts', verifyToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!await hasTournamentRole(req.user.userId, id, ['tournament_admin', 'mat_manager'])) return res.status(403).json({ error: 'Accès refusé' });
+    const status = req.query.status || 'pending';
+    const r = await pool.query(`
+      SELECT mra.*,
+        reporter.name AS reporter_name,
+        m.red_athlete_id, m.blue_athlete_id, m.winner_id, m.loser_id,
+        m.score_red, m.score_blue, m.win_type, m.status AS match_status,
+        m.mat_id, m.competition_id, m.pool_id, m.match_type, m.bracket, m.round,
+        ra.first_name||' '||ra.last_name AS red_name,  rc.short_name AS red_club,
+        ba.first_name||' '||ba.last_name AS blue_name, bc.short_name AS blue_club,
+        wa.first_name||' '||wa.last_name AS winner_name,
+        mt.name AS mat_name,
+        comp.age_category, comp.weight_category, comp.style
+      FROM match_result_alerts mra
+      LEFT JOIN users reporter ON reporter.id = mra.reported_by
+      LEFT JOIN matches m  ON m.id  = mra.match_id
+      LEFT JOIN athletes ra ON ra.id = m.red_athlete_id  LEFT JOIN clubs rc ON rc.id = ra.club_id
+      LEFT JOIN athletes ba ON ba.id = m.blue_athlete_id LEFT JOIN clubs bc ON bc.id = ba.club_id
+      LEFT JOIN athletes wa ON wa.id = m.winner_id
+      LEFT JOIN mats mt ON mt.id = m.mat_id
+      LEFT JOIN competitions comp ON comp.id = m.competition_id
+      WHERE mra.tournament_id=$1 AND mra.status=$2
+      ORDER BY mra.reported_at DESC
+    `, [id, status]);
+    res.json(r.rows);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// PUT /api/alerts/:alertId/archive — Archiver une alerte (après correction)
+app.put('/api/alerts/:alertId/archive', verifyToken, async (req, res) => {
+  try {
+    const alertR = await pool.query('SELECT * FROM match_result_alerts WHERE id=$1', [req.params.alertId]);
+    if (!alertR.rows.length) return res.status(404).json({ error: 'Alerte introuvable' });
+    const alert = alertR.rows[0];
+    if (!await hasTournamentRole(req.user.userId, alert.tournament_id, ['tournament_admin', 'mat_manager'])) return res.status(403).json({ error: 'Accès refusé' });
+    const r = await pool.query(
+      `UPDATE match_result_alerts SET status='archived',archived_by=$1,archived_at=now() WHERE id=$2 RETURNING *`,
+      [req.user.userId, req.params.alertId]
+    );
+    broadcastToTournament(alert.tournament_id, { type: 'alert_archived', alertId: req.params.alertId });
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// PUT /api/matches/:matchId/result/correct — Corriger un résultat (admin / mat_manager)
+app.put('/api/matches/:matchId/result/correct', verifyToken, async (req, res) => {
+  try {
+    const { matchId } = req.params;
+    const matchR = await pool.query('SELECT * FROM matches WHERE id=$1', [matchId]);
+    if (!matchR.rows.length) return res.status(404).json({ error: 'Combat introuvable' });
+    const match = matchR.rows[0];
+
+    if (!await hasTournamentRole(req.user.userId, match.tournament_id, ['tournament_admin', 'mat_manager'])) return res.status(403).json({ error: 'Accès refusé' });
+
+    const { winner_id, score_red, score_blue, win_type, alert_id } = req.body;
+    if (!winner_id) return res.status(400).json({ error: 'winner_id requis' });
+
+    const oldWinnerId = match.winner_id;
+    const newLoserId = winner_id === match.red_athlete_id ? match.blue_athlete_id : match.red_athlete_id;
+    const oldLoserId = match.loser_id || (oldWinnerId === match.red_athlete_id ? match.blue_athlete_id : match.red_athlete_id);
+
+    // Mettre à jour le résultat
+    await pool.query(
+      `UPDATE matches SET winner_id=$1,loser_id=$2,score_red=$3,score_blue=$4,win_type=$5,updated_at=now() WHERE id=$6`,
+      [winner_id, newLoserId,
+       score_red  != null ? parseInt(score_red)    : match.score_red,
+       score_blue != null ? parseInt(score_blue)   : match.score_blue,
+       win_type   || match.win_type, matchId]
+    );
+
+    // Corriger le tableau : remplacer l'ancien vainqueur dans winner_to (si pas encore joué)
+    if (oldWinnerId && oldWinnerId !== winner_id && match.winner_to) {
+      const nm = (await pool.query('SELECT * FROM matches WHERE id=$1', [match.winner_to])).rows[0];
+      if (nm && nm.status !== 'finished') {
+        if      (nm.red_athlete_id  === oldWinnerId) await pool.query('UPDATE matches SET red_athlete_id=$1,updated_at=now()  WHERE id=$2', [winner_id, nm.id]);
+        else if (nm.blue_athlete_id === oldWinnerId) await pool.query('UPDATE matches SET blue_athlete_id=$1,updated_at=now() WHERE id=$2', [winner_id, nm.id]);
+      }
+    }
+
+    // Corriger le repêchage : remplacer l'ancien perdant dans loser_to (si pas encore joué)
+    if (oldLoserId && oldLoserId !== newLoserId && match.loser_to) {
+      const lm = (await pool.query('SELECT * FROM matches WHERE id=$1', [match.loser_to])).rows[0];
+      if (lm && lm.status !== 'finished') {
+        if      (lm.red_athlete_id  === oldLoserId) await pool.query('UPDATE matches SET red_athlete_id=$1,updated_at=now()  WHERE id=$2', [newLoserId, lm.id]);
+        else if (lm.blue_athlete_id === oldLoserId) await pool.query('UPDATE matches SET blue_athlete_id=$1,updated_at=now() WHERE id=$2', [newLoserId, lm.id]);
+      }
+    }
+
+    // Archiver l'alerte associée si fournie
+    if (alert_id) {
+      await pool.query(`UPDATE match_result_alerts SET status='archived',archived_by=$1,archived_at=now() WHERE id=$2`, [req.user.userId, alert_id]);
+      broadcastToTournament(match.tournament_id, { type: 'alert_archived', alertId: alert_id });
+    }
+
+    const updated = await pool.query('SELECT * FROM matches WHERE id=$1', [matchId]);
+    broadcastToTournament(match.tournament_id, { type: 'match_corrected', match: updated.rows[0] });
+    await audit(match.tournament_id, req.user.userId, 'MATCH_RESULT', 'match', matchId, match, updated.rows[0]);
+
+    res.json(updated.rows[0]);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// ─────────────────────────────────────────────
 // MATCH QUEUE
 // ─────────────────────────────────────────────
 
@@ -2870,6 +3018,18 @@ pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS jeunes_weight_toler
 
 pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS auto_launch_next BOOLEAN NOT NULL DEFAULT FALSE`)
   .catch(e => console.warn('Migration tournaments.auto_launch_next:', e.message));
+
+pool.query(`CREATE TABLE IF NOT EXISTS match_result_alerts (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  match_id UUID REFERENCES matches(id) ON DELETE CASCADE,
+  tournament_id UUID NOT NULL REFERENCES tournaments(id) ON DELETE CASCADE,
+  reported_by UUID REFERENCES users(id) ON DELETE SET NULL,
+  reported_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  note TEXT,
+  status VARCHAR(20) NOT NULL DEFAULT 'pending',
+  archived_by UUID REFERENCES users(id) ON DELETE SET NULL,
+  archived_at TIMESTAMPTZ
+)`).catch(e => console.warn('Migration match_result_alerts:', e.message));
 
 // Allow 'MX' (mixte) gender for jeunes mixed pools
 // ALTER TYPE ADD VALUE cannot run inside a transaction — must be a top-level statement
