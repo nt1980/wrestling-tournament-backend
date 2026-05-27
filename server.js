@@ -1948,9 +1948,13 @@ app.get('/api/tournaments/:id/programme', async (req, res) => {
       [req.params.id]
     );
     if (!t.rows.length) return res.status(404).json({ error: 'Tournoi introuvable' });
-    if (!t.rows[0].public_page_enabled || !t.rows[0].public_program_enabled)
+
+    const row = t.rows[0];
+    // Seul public_program_enabled est requis — public_page_enabled est garanti par la page d'accueil publique
+    if (!row.public_page_enabled && !row.public_program_enabled)
       return res.status(403).json({ error: 'Programme non public' });
-    const tid = t.rows[0].id;  // ← UUID réel pour les requêtes SQL
+
+    const tid = row.id;
 
     // Competitions
     const comps = await pool.query(
@@ -1959,7 +1963,7 @@ app.get('/api/tournaments/:id/programme', async (req, res) => {
        LEFT JOIN (SELECT DISTINCT athlete_id, competition_id FROM pool_athletes) ca ON ca.competition_id = c.id
        WHERE c.tournament_id=$1
        GROUP BY c.id
-       ORDER BY c.age_category, c.weight_category`,
+       ORDER BY c.age_category, c.weight_category NULLS LAST`,
       [tid]
     );
 
@@ -1980,13 +1984,14 @@ app.get('/api/tournaments/:id/programme', async (req, res) => {
        LEFT JOIN tournament_registrations tr ON tr.athlete_id = a.id AND tr.tournament_id = c.tournament_id
        WHERE c.tournament_id = $1
        GROUP BY p.id, c.age_category, c.weight_category, c.style, c.gender
-       ORDER BY c.age_category, c.weight_category, p.name`,
+       ORDER BY c.age_category, c.weight_category NULLS LAST, p.name`,
       [tid]
     );
 
+    console.log(`[programme] tid=${tid} comps=${comps.rowCount} pools=${pools.rowCount}`);
     res.json({ competitions: comps.rows, pools: pools.rows });
   } catch (e) {
-    console.error(e);
+    console.error('[programme] error:', e.message);
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
