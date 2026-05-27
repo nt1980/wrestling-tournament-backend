@@ -1958,9 +1958,10 @@ app.get('/api/tournaments/:id/programme', async (req, res) => {
 
     // Competitions
     const comps = await pool.query(
-      `SELECT c.*, COUNT(ca.athlete_id) AS athlete_count
+      `SELECT c.*, COUNT(DISTINCT pa.athlete_id) AS athlete_count
        FROM competitions c
-       LEFT JOIN (SELECT DISTINCT athlete_id, competition_id FROM pool_athletes) ca ON ca.competition_id = c.id
+       LEFT JOIN pools p2  ON p2.competition_id = c.id
+       LEFT JOIN pool_athletes pa ON pa.pool_id = p2.id
        WHERE c.tournament_id=$1
        GROUP BY c.id
        ORDER BY c.age_category, c.weight_category NULLS LAST`,
