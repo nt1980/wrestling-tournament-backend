@@ -1988,17 +1988,21 @@ app.get('/api/matches/:matchId', async (req, res) => {
   try {
     const r = await pool.query(
       `SELECT m.*,
-        ra.first_name||' '||ra.last_name as red_name, rc.short_name as red_club,
+        ra.first_name||' '||ra.last_name as red_name,  rc.short_name as red_club,
         ba.first_name||' '||ba.last_name as blue_name, bc.short_name as blue_club,
         wa.first_name||' '||wa.last_name as winner_name,
         mt.name as mat_name,
-        comp.style, comp.age_category, comp.weight_category, comp.gender
+        ref_user.name as referee_name,
+        comp.style, comp.age_category, comp.weight_category, comp.gender,
+        p.name as pool_name
        FROM matches m
        LEFT JOIN athletes ra ON ra.id=m.red_athlete_id LEFT JOIN clubs rc ON rc.id=ra.club_id
        LEFT JOIN athletes ba ON ba.id=m.blue_athlete_id LEFT JOIN clubs bc ON bc.id=ba.club_id
        LEFT JOIN athletes wa ON wa.id=m.winner_id
        LEFT JOIN mats mt ON mt.id=m.mat_id
+       LEFT JOIN users ref_user ON ref_user.id=mt.referee_id
        LEFT JOIN competitions comp ON comp.id=m.competition_id
+       LEFT JOIN pools p ON p.id=m.pool_id
        WHERE m.id=$1`,
       [req.params.matchId]
     );
