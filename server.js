@@ -2026,7 +2026,7 @@ app.get('/api/tournaments/:id/public-queue', async (req, res) => {
     );
 
     // Regrouper par tapis
-    const byMat: Record<string, any> = {};
+    const byMat = {};
     for (const row of rows.rows) {
       if (!byMat[row.mat_id]) byMat[row.mat_id] = { mat_id: row.mat_id, mat_name: row.mat_name, current: null, queue: [] };
       if (row.queue_status === 'on_mat') byMat[row.mat_id].current = row;
