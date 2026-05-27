@@ -359,7 +359,7 @@ app.put('/api/tournaments/:id', verifyToken, async (req, res) => {
     const { name, event_date, city, organizer_club_id, status, number_of_mats,
       public_page_enabled, public_program_enabled, public_results_enabled,
       public_live_matches_enabled, public_rankings_enabled, repechage_mode,
-      min_rest_minutes, jeunes_weight_tolerance, slug: newSlug } = req.body;
+      min_rest_minutes, jeunes_weight_tolerance, auto_launch_next, slug: newSlug } = req.body;
 
     // Validation et unicité du slug si fourni
     let validatedSlug = null;
@@ -385,14 +385,16 @@ app.put('/api/tournaments/:id', verifyToken, async (req, res) => {
         min_rest_minutes=COALESCE($13,min_rest_minutes),
         jeunes_weight_tolerance=COALESCE($14,jeunes_weight_tolerance),
         slug=COALESCE($15,slug),
+        auto_launch_next=COALESCE($16,auto_launch_next),
         updated_at=now()
-      WHERE id=$16 RETURNING *`,
+      WHERE id=$17 RETURNING *`,
       [name, event_date, city, organizer_club_id, status, number_of_mats,
        public_page_enabled, public_program_enabled, public_results_enabled,
        public_live_matches_enabled, public_rankings_enabled, repechage_mode,
        min_rest_minutes != null ? parseInt(min_rest_minutes) : null,
        jeunes_weight_tolerance != null ? parseFloat(jeunes_weight_tolerance) : null,
        validatedSlug,
+       auto_launch_next != null ? Boolean(auto_launch_next) : null,
        id]
     );
     res.json(r.rows[0]);
@@ -1398,6 +1400,24 @@ app.put('/api/matches/:matchId/result', verifyToken, async (req, res) => {
     const updated = await pool.query('SELECT * FROM matches WHERE id=$1', [matchId]);
     broadcastToTournament(match.tournament_id, { type: 'match_finished', match: updated.rows[0] });
     await audit(match.tournament_id, req.user.userId, 'MATCH_RESULT', 'match', matchId, match, updated.rows[0]);
+
+    // Auto-lancement du combat suivant si l'option est activée pour ce tournoi
+    if (match.mat_id) {
+      const tSettings = await pool.query('SELECT auto_launch_next FROM tournaments WHERE id=$1', [match.tournament_id]);
+      if (tSettings.rows[0]?.auto_launch_next) {
+        const nextQueue = await pool.query(
+          `SELECT * FROM match_queue WHERE mat_id=$1 AND status='ready' ORDER BY position ASC LIMIT 1`,
+          [match.mat_id]
+        );
+        if (nextQueue.rows.length) {
+          const nq = nextQueue.rows[0];
+          await pool.query(`UPDATE match_queue SET status='on_mat',updated_at=now() WHERE id=$1`, [nq.id]);
+          await pool.query(`UPDATE matches SET status='on_mat',mat_id=$1,updated_at=now() WHERE id=$2`, [nq.mat_id, nq.match_id]);
+          const promotedQueue = await pool.query('SELECT * FROM match_queue WHERE id=$1', [nq.id]);
+          broadcastToTournament(match.tournament_id, { type: 'match_promoted', queue: promotedQueue.rows[0] });
+        }
+      }
+    }
 
     res.json(updated.rows[0]);
   } catch (e) {
@@ -2847,6 +2867,9 @@ pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS min_rest_minutes IN
 
 pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS jeunes_weight_tolerance NUMERIC(4,1) NOT NULL DEFAULT 10.0`)
   .catch(e => console.warn('Migration tournaments.jeunes_weight_tolerance:', e.message));
+
+pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS auto_launch_next BOOLEAN NOT NULL DEFAULT FALSE`)
+  .catch(e => console.warn('Migration tournaments.auto_launch_next:', e.message));
 
 // Allow 'MX' (mixte) gender for jeunes mixed pools
 // ALTER TYPE ADD VALUE cannot run inside a transaction — must be a top-level statement
