@@ -2972,7 +2972,7 @@ app.get('/api/tournaments/:id/jeunes/rankings', async (req, res) => {
         console.error(`[jeunes/rankings] ranking error for pool ${jp.pool_id}:`, rankErr.message);
       }
       const matchesR = await pool.query(
-        `SELECT m.id, m.round, m.position, m.status, m.win_type,
+        `SELECT m.id, m.round, m.index_in_round, m.status, m.win_type,
             m.score_red, m.score_blue, m.red_athlete_id, m.blue_athlete_id, m.winner_id,
             r.first_name||' '||r.last_name AS red_name,
             b.first_name||' '||b.last_name AS blue_name,
