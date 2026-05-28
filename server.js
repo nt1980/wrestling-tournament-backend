@@ -2985,7 +2985,7 @@ app.get('/api/tournaments/:id/jeunes/rankings', async (req, res) => {
          LEFT JOIN match_queue mq ON mq.match_id=m.id
          LEFT JOIN mats mt ON mt.id=mq.mat_id
          WHERE m.competition_id=$1 AND m.is_bye=false
-         ORDER BY m.round, m.position`,
+         ORDER BY m.round, m.index_in_round`,
         [jp.competition_id]
       );
       // All pool athletes for complete ranking (even before matches)
