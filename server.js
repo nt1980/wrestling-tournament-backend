@@ -2911,7 +2911,22 @@ app.post('/api/tournaments/:id/jeunes/pools/:jeunesPoolId/generate-matches', ver
   } catch (e) { console.error(e); res.status(500).json({ error: 'Erreur génération matchs' }); }
 });
 
-// POST — Générer tous les matchs d'une catégorie d'âge
+// DELETE — Annuler les matchs d'une poule jeunes (sans toucher aux athlètes)
+app.delete('/api/tournaments/:id/jeunes/pools/:jeunesPoolId/matches', verifyToken, async (req, res) => {
+  try {
+    if (!await hasTournamentRole(req.user.userId, req.params.id, ['tournament_admin']))
+      return res.status(403).json({ error: 'Accès refusé' });
+    const jpR = await pool.query('SELECT * FROM jeunes_pools WHERE id=$1 AND tournament_id=$2', [req.params.jeunesPoolId, req.params.id]);
+    if (!jpR.rows.length) return res.status(404).json({ error: 'Poule introuvable' });
+    const jp = jpR.rows[0];
+    await pool.query(`DELETE FROM match_queue WHERE match_id IN (SELECT id FROM matches WHERE competition_id=$1)`, [jp.competition_id]);
+    await pool.query(`DELETE FROM matches WHERE competition_id=$1`, [jp.competition_id]);
+    broadcastToTournament(req.params.id, { type: 'jeunes_updated' });
+    res.json({ ok: true });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'Erreur suppression matchs' }); }
+});
+
+// POST — Générer tous les matchs d'une catégorie d'âge (seulement les poules sans matchs)
 app.post('/api/tournaments/:id/jeunes/:ageCategory/generate-matches', verifyToken, async (req, res) => {
   try {
     if (!await hasTournamentRole(req.user.userId, req.params.id, ['tournament_admin']))
@@ -2922,15 +2937,18 @@ app.post('/api/tournaments/:id/jeunes/:ageCategory/generate-matches', verifyToke
       [req.params.id, ageCategory]
     );
     let totalMatches = 0;
+    let poolsSkipped = 0;
     for (const jp of poolsR.rows) {
+      // Sauter les poules qui ont déjà des matchs générés
+      const existingR = await pool.query(`SELECT COUNT(*) AS cnt FROM matches WHERE competition_id=$1`, [jp.competition_id]);
+      if (Number(existingR.rows[0].cnt) > 0) { poolsSkipped++; continue; }
+
       const athletesR = await pool.query(
         `SELECT a.*, c.short_name AS club_short, pa.seed_order
          FROM pool_athletes pa JOIN athletes a ON a.id=pa.athlete_id LEFT JOIN clubs c ON c.id=a.club_id
          WHERE pa.pool_id=$1 ORDER BY pa.seed_order`, [jp.pool_id]
       );
       if (athletesR.rows.length < 2) continue;
-      await pool.query(`DELETE FROM match_queue WHERE match_id IN (SELECT id FROM matches WHERE competition_id=$1)`, [jp.competition_id]);
-      await pool.query(`DELETE FROM matches WHERE competition_id=$1`, [jp.competition_id]);
       const poolRow = (await pool.query('SELECT * FROM pools WHERE id=$1', [jp.pool_id])).rows[0];
       const matches = await generateNordic(jp.competition_id, req.params.id, athletesR.rows, poolRow);
       for (let i = 0; i < matches.length; i++) {
@@ -2940,7 +2958,7 @@ app.post('/api/tournaments/:id/jeunes/:ageCategory/generate-matches', verifyToke
       totalMatches += matches.length;
     }
     broadcastToTournament(req.params.id, { type: 'jeunes_updated' });
-    res.json({ matches_created: totalMatches, pools_processed: poolsR.rows.length });
+    res.json({ matches_created: totalMatches, pools_processed: poolsR.rows.length - poolsSkipped, pools_skipped: poolsSkipped });
   } catch (e) { console.error(e); res.status(500).json({ error: 'Erreur génération matchs' }); }
 });
 
