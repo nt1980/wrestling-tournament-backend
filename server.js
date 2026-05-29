@@ -8,6 +8,7 @@ import jwt from 'jsonwebtoken';
 import { WebSocketServer } from 'ws';
 import { createServer } from 'http';
 import { parse as csvParse } from 'csv-parse/sync';
+import nodemailer from 'nodemailer';
 import { generateNordic, generatePoolsAndFinals, generateBracket } from './services/bracket.js';
 import { computePoolRankings, computeBracketRankings, computeJeunesPoolRankings } from './services/ranking.js';
 import { generateJeunesPools, deleteJeunesPools } from './services/jeunes.js';
@@ -359,7 +360,11 @@ app.put('/api/tournaments/:id', verifyToken, async (req, res) => {
     const { name, event_date, city, organizer_club_id, status, number_of_mats,
       public_page_enabled, public_program_enabled, public_results_enabled,
       public_live_matches_enabled, public_rankings_enabled, repechage_mode,
-      min_rest_minutes, jeunes_weight_tolerance, auto_launch_next, slug: newSlug } = req.body;
+      min_rest_minutes, jeunes_weight_tolerance, auto_launch_next, slug: newSlug,
+      notification_emails } = req.body;
+
+    // Migration inline : colonne notification_emails
+    await pool.query('ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS notification_emails TEXT').catch(() => {});
 
     // Validation et unicité du slug si fourni
     let validatedSlug = null;
@@ -386,8 +391,9 @@ app.put('/api/tournaments/:id', verifyToken, async (req, res) => {
         jeunes_weight_tolerance=COALESCE($14,jeunes_weight_tolerance),
         slug=COALESCE($15,slug),
         auto_launch_next=COALESCE($16,auto_launch_next),
+        notification_emails=COALESCE($17,notification_emails),
         updated_at=now()
-      WHERE id=$17 RETURNING *`,
+      WHERE id=$18 RETURNING *`,
       [name, event_date, city, organizer_club_id, status, number_of_mats,
        public_page_enabled, public_program_enabled, public_results_enabled,
        public_live_matches_enabled, public_rankings_enabled, repechage_mode,
@@ -395,6 +401,7 @@ app.put('/api/tournaments/:id', verifyToken, async (req, res) => {
        jeunes_weight_tolerance != null ? parseFloat(jeunes_weight_tolerance) : null,
        validatedSlug,
        auto_launch_next != null ? Boolean(auto_launch_next) : null,
+       notification_emails !== undefined ? (notification_emails || null) : null,
        id]
     );
     res.json(r.rows[0]);
@@ -1103,6 +1110,95 @@ app.put('/api/tournaments/:id/registrations/:regId/weigh-in', verifyToken, async
     res.json(r.rows[0]);
   } catch (e) {
     res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// Envoyer CSV pesées par email
+app.post('/api/tournaments/:id/weigh-in/send-csv', verifyToken, async (req, res) => {
+  try {
+    if (!await hasTournamentRole(req.user.userId, req.params.id, ['tournament_admin', 'weigh_in_manager']))
+      return res.status(403).json({ error: 'Accès refusé' });
+
+    const { age_category } = req.body;
+
+    // Récupérer le tournoi et ses emails
+    await pool.query('ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS notification_emails TEXT').catch(() => {});
+    const tR = await pool.query('SELECT name, notification_emails FROM tournaments WHERE id=$1', [req.params.id]);
+    if (!tR.rowCount) return res.status(404).json({ error: 'Tournoi introuvable' });
+    const tournament = tR.rows[0];
+
+    const emails = (tournament.notification_emails || '').split(';').map(e => e.trim()).filter(Boolean);
+    if (emails.length === 0)
+      return res.status(400).json({ error: 'Aucune adresse e-mail configurée dans les paramètres du tournoi' });
+
+    // Vérifier config SMTP
+    if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS)
+      return res.status(500).json({ error: 'Configuration SMTP manquante sur le serveur (SMTP_HOST, SMTP_USER, SMTP_PASS)' });
+
+    // Récupérer les inscriptions filtrées
+    const params = [req.params.id];
+    let ageCond = '';
+    if (age_category && age_category !== 'all') {
+      ageCond = ' AND tr.final_age_category = $2';
+      params.push(age_category);
+    }
+    const r = await pool.query(
+      `SELECT a.last_name, a.first_name, a.gender, a.license_number,
+              c.name as club_name, tr.final_age_category, tr.final_weight_category,
+              tr.weigh_in_weight_kg, tr.weigh_in_status
+       FROM tournament_registrations tr
+       JOIN athletes a ON a.id = tr.athlete_id
+       LEFT JOIN clubs c ON c.id = a.club_id
+       WHERE tr.tournament_id = $1${ageCond}
+       ORDER BY tr.final_age_category, a.last_name, a.first_name`,
+      params
+    );
+    const regs = r.rows;
+
+    // Générer le CSV (séparateur ";" + BOM UTF-8 pour Excel)
+    const STATUS_LABEL = { done: 'Pesé', overweight: 'Hors catégorie', no_show: 'Absent', pending: 'En attente' };
+    const headers = ['Nom', 'Prénom', 'Sexe', 'Licence', 'Club', 'Catégorie âge', 'Catégorie poids', 'Poids relevé (kg)', 'Statut'];
+    const rows = regs.map(row => [
+      row.last_name || '',
+      row.first_name || '',
+      row.gender || '',
+      row.license_number || '',
+      row.club_name || '',
+      row.final_age_category || '',
+      row.final_weight_category || '',
+      row.weigh_in_weight_kg != null ? String(row.weigh_in_weight_kg) : '',
+      STATUS_LABEL[row.weigh_in_status] || row.weigh_in_status || '',
+    ]);
+    const csvLines = [headers, ...rows]
+      .map(row => row.map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(';'))
+      .join('\r\n');
+    const csvContent = '﻿' + csvLines; // BOM UTF-8
+
+    // Envoi email
+    const transporter = nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port: parseInt(process.env.SMTP_PORT || '587'),
+      secure: process.env.SMTP_SECURE === 'true',
+      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+    });
+
+    const catLabel = age_category && age_category !== 'all' ? ` — Catégorie ${age_category}` : '';
+    const dateStr = new Date().toLocaleDateString('fr-FR');
+    const fileDate = new Date().toISOString().slice(0, 10);
+    const filename = `pesees${age_category && age_category !== 'all' ? `_${age_category}` : ''}_${fileDate}.csv`;
+
+    await transporter.sendMail({
+      from: process.env.SMTP_FROM || process.env.SMTP_USER,
+      to: emails.join(', '),
+      subject: `Pesées${catLabel} — ${tournament.name} — ${dateStr}`,
+      text: `Bonjour,\n\nVeuillez trouver en pièce jointe le CSV des pesées${catLabel} pour le tournoi "${tournament.name}".\n\n${regs.length} participant(s) inclus.\n\nCordialement`,
+      attachments: [{ filename, content: csvContent, encoding: 'utf8' }],
+    });
+
+    res.json({ sent: emails.length, recipients: emails, rows: regs.length });
+  } catch (e) {
+    console.error('weigh-in send-csv error:', e);
+    res.status(500).json({ error: `Erreur envoi email : ${e.message}` });
   }
 });
 
