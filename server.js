@@ -523,16 +523,18 @@ app.put('/api/mats/:matId', verifyToken, async (req, res) => {
       return res.status(403).json({ error: 'Accès refusé' });
     }
 
-    const { name, is_active, slug } = req.body;
+    const { name, is_active, slug, is_jeune } = req.body;
     if (name !== undefined && !name.trim()) return res.status(400).json({ error: 'Nom invalide' });
 
-    // Ajouter la colonne is_active si elle n'existe pas encore
+    // Ajouter les colonnes si elles n'existent pas encore
     await pool.query(`ALTER TABLE mats ADD COLUMN IF NOT EXISTS is_active boolean DEFAULT true`).catch(() => {});
+    await pool.query(`ALTER TABLE mats ADD COLUMN IF NOT EXISTS is_jeune boolean DEFAULT false`).catch(() => {});
 
     const updates = [];
     const params = [];
     if (name !== undefined) { params.push(name.trim()); updates.push(`name=$${params.length}`); }
     if (is_active !== undefined) { params.push(is_active); updates.push(`is_active=$${params.length}`); }
+    if (is_jeune !== undefined) { params.push(is_jeune); updates.push(`is_jeune=$${params.length}`); }
     if (slug !== undefined) {
       const cleanSlug = slug.trim().toLowerCase().replace(/[^a-z0-9-]/g, '');
       if (!cleanSlug || cleanSlug.length < 1 || cleanSlug.length > 50)
@@ -1589,7 +1591,7 @@ app.get('/api/tournaments/:id/queue', async (req, res) => {
         b.first_name||' '||b.last_name as blue_name, bc.short_name as blue_club,
         mt.name as mat_name,
         p.name as pool_name,
-        comp.style,comp.age_category,comp.weight_category,comp.gender,comp.format_type,
+        comp.style,comp.age_category,comp.weight_category,comp.gender,comp.format_type,comp.source as competition_source,
         (SELECT MAX(m2.ended_at) FROM matches m2
           WHERE m2.tournament_id=mq.tournament_id AND m2.status='finished'
           AND m2.ended_at IS NOT NULL AND m2.id != mq.match_id
