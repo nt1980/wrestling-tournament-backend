@@ -782,6 +782,18 @@ const normalizeStyle = (s) => {
   return null;
 };
 
+// Normalise les valeurs de catégorie d'âge vers les valeurs ENUM PostgreSQL
+const normalizeAgeCategory = (s) => {
+  if (!s) return null;
+  const v = s.trim();
+  const valid = ['U7', 'U9', 'U11', 'U13', 'U15', 'U17', 'U19', 'Senior'];
+  if (valid.includes(v)) return v;
+  // Mappings spéciaux : catégories frontend non présentes dans l'enum
+  if (v === 'U20' || v === 'U23') return 'Senior';
+  if (v.toLowerCase().includes('vétéran') || v.toLowerCase().includes('veteran')) return 'Senior';
+  return null;
+};
+
 const normalizeGender = (s) => {
   if (!s) return null;
   const v = s.toLowerCase().trim();
@@ -965,14 +977,11 @@ app.post('/api/tournaments/:id/registrations', verifyToken, async (req, res) => 
   try {
     if (!await hasTournamentRole(req.user.userId, req.params.id, ['tournament_admin', 'weigh_in_manager'])) return res.status(403).json({ error: 'Accès refusé' });
     const { athlete_id, final_age_category, final_weight_category, final_style } = req.body;
-    // inline migrations: ensure columns and unique index exist
-    await pool.query('ALTER TABLE tournament_registrations ADD COLUMN IF NOT EXISTS final_weight_category text').catch(() => {});
-    await pool.query('ALTER TABLE tournament_registrations ADD COLUMN IF NOT EXISTS final_age_category text').catch(() => {});
-    await pool.query('ALTER TABLE tournament_registrations ADD COLUMN IF NOT EXISTS final_style text').catch(() => {});
-    await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS uq_treg_tid_aid ON tournament_registrations(tournament_id, athlete_id)').catch(() => {});
+    const normAge   = normalizeAgeCategory(final_age_category);
+    const normStyle = normalizeStyle(final_style);
     const r = await pool.query(
       'INSERT INTO tournament_registrations(id,tournament_id,athlete_id,final_age_category,final_weight_category,final_style) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(tournament_id,athlete_id) DO NOTHING RETURNING *',
-      [uuidv4(), req.params.id, athlete_id, final_age_category || null, final_weight_category || null, final_style || null]
+      [uuidv4(), req.params.id, athlete_id, normAge, final_weight_category || null, normStyle]
     );
     res.status(201).json(r.rows[0] ?? null);
   } catch (e) {
@@ -1048,7 +1057,7 @@ app.put('/api/tournaments/:id/registrations/:regId', verifyToken, async (req, re
            updated_at = now()
        WHERE id=$4 AND tournament_id=$5
        RETURNING *`,
-      [final_age_category || null, final_style || null, final_weight_category || null,
+      [normalizeAgeCategory(final_age_category), normalizeStyle(final_style), final_weight_category || null,
        req.params.regId, req.params.id]
     );
     res.json(r.rows[0]);
