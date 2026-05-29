@@ -613,91 +613,102 @@ export async function generateBracket(
 // ---------------------------------------------------------------------------
 
 /**
+ * Build the spiral match-distribution order for N first-round matches.
+ *
+ * The sequence visits matches so that consecutive athletes from the same
+ * club are as far apart as possible in the bracket:
+ *   athlete 1 → match 1   (top)
+ *   athlete 2 → match N   (bottom)
+ *   athlete 3 → match N/2 (mid-top)
+ *   athlete 4 → match N/2+1 (mid-bottom)
+ *   athlete 5 → match 2   (near top)
+ *   athlete 6 → match N-1 (near bottom)
+ *   …
+ *
+ * This ensures same-club athletes can only meet at the latest possible
+ * stage (semi-final if the club has ≤ 4 athletes in 4 quarters, etc.).
+ * Returns 0-indexed match numbers.
+ */
+function buildMatchOrder(N) {
+  const order = [];
+  for (let i = 0; order.length < N; i++) {
+    const a = i;                      // top portion    (0, 1, 2 …)
+    const b = N - 1 - i;              // bottom portion (N-1, N-2 …)
+    const c = Math.floor(N / 2) - 1 - i; // lower-mid descending
+    const d = Math.floor(N / 2) + i;  // upper-mid ascending
+
+    if (order.length < N) order.push(a);
+    if (order.length < N && b !== a) order.push(b);
+    if (order.length < N && c >= 0 && c !== b && c !== a) order.push(c);
+    if (order.length < N && d !== c && d !== b && d !== a) order.push(d);
+  }
+  return order;
+}
+
+/**
  * Return an array of length bracketSize with athlete objects or null (BYE).
- * Guarantees that same-club athletes do NOT meet in the first round
- * by computing actual first-round opponent pairs before assigning athletes.
+ *
+ * Distribution strategy (per user spec):
+ *   1. Sort clubs by size, largest first.
+ *   2. For each club, assign athletes one-by-one to match slots using the
+ *      spiral order (match 1, N, N/2, N/2+1, 2, N-1, …), restarting the
+ *      spiral from the beginning for each new club.
+ *   3. Within each match the first arrival takes the red slot, the second
+ *      takes the blue slot.
+ *
+ * If a club has more athletes than there are first-round matches, two of its
+ * athletes inevitably share a match (unavoidable).
  */
 function seedAthletes(athletes, bracketSize) {
   const slots = new Array(bracketSize).fill(null);
   if (athletes.length === 0) return slots;
 
-  const n = athletes.length;
+  const N = bracketSize / 2; // number of first-round matches
+  const matchOrder = buildMatchOrder(N);
 
-  // Standard seeding positions for power-of-2 brackets.
-  // Seeds 1 and 2 can only meet in the final, 1-4 only in semis, etc.
-  const seedPositions = buildSeedPositions(bracketSize);
+  // Two slots per match: [0] = red, [1] = blue
+  const matchSlots = Array.from({ length: N }, () => [null, null]);
 
-  // Build inverse mapping: slot → ordered index
-  const inverseSeeds = new Array(bracketSize);
-  for (let i = 0; i < bracketSize; i++) {
-    inverseSeeds[seedPositions[i]] = i;
-  }
-
-  // Compute first-round opponent pairs in ordered-index space.
-  // matchPairs[k] = [ordIdxRed, ordIdxBlue]: the two ordered positions
-  // that will fight each other in first-round match k.
-  // (Slot 2k vs slot 2k+1 → ordered index inverseSeeds[2k] vs inverseSeeds[2k+1])
-  const matchPairs = [];
-  for (let slot = 0; slot < bracketSize; slot += 2) {
-    matchPairs.push([inverseSeeds[slot], inverseSeeds[slot + 1]]);
-  }
-
-  // Group athletes by club, sort groups by size descending
+  // Group athletes by club, sort by club size descending
   const byClub = new Map();
   for (const a of athletes) {
     const club = a.club_id ?? `__solo_${a.id}`;
     if (!byClub.has(club)) byClub.set(club, []);
     byClub.get(club).push(a);
   }
-  const queues = [...byClub.values()].sort((a, b) => b.length - a.length);
+  const clubGroups = [...byClub.values()].sort((a, b) => b.length - a.length);
 
-  // Pick next athlete from the largest available club.
-  // If excludeClub is given, prefer a different club (cross-club pairing).
-  const popLargest = (excludeClub = null) => {
-    queues.sort((a, b) => b.length - a.length);
-    if (excludeClub !== null) {
-      for (const q of queues) {
-        if (q.length > 0) {
-          const club = q[0].club_id ?? `__solo_${q[0].id}`;
-          if (club !== excludeClub) return q.shift();
+  // For each club, walk the spiral order from the start and fill slots
+  for (const group of clubGroups) {
+    let orderPos = 0;
+    for (const athlete of group) {
+      let placed = false;
+      // Walk spiral until we find a free slot
+      while (orderPos < matchOrder.length && !placed) {
+        const matchIdx = matchOrder[orderPos];
+        if (matchSlots[matchIdx][0] === null) {
+          matchSlots[matchIdx][0] = athlete;
+          placed = true;
+        } else if (matchSlots[matchIdx][1] === null) {
+          matchSlots[matchIdx][1] = athlete;
+          placed = true;
+        }
+        orderPos++;
+      }
+      // Fallback: bracket might be full on the spiral — scan all matches
+      if (!placed) {
+        for (let m = 0; m < N && !placed; m++) {
+          if (matchSlots[m][0] === null)      { matchSlots[m][0] = athlete; placed = true; }
+          else if (matchSlots[m][1] === null) { matchSlots[m][1] = athlete; placed = true; }
         }
       }
     }
-    // Fallback: pick from largest non-empty queue (same club if unavoidable)
-    for (const q of queues) {
-      if (q.length > 0) return q.shift();
-    }
-    return null;
-  };
-
-  const ordered = new Array(bracketSize).fill(null);
-
-  // Step 1: fill real first-round matches (both opponents are real athletes)
-  // with athletes from different clubs when possible.
-  const realPairs = matchPairs.filter(([a, b]) => a < n && b < n);
-  const byePairs  = matchPairs.filter(([a, b]) => !(a < n && b < n));
-
-  for (const [idxA, idxB] of realPairs) {
-    const athleteA = popLargest();
-    if (!athleteA) break;
-    ordered[idxA] = athleteA;
-    const clubA = athleteA.club_id ?? `__solo_${athleteA.id}`;
-
-    const athleteB = popLargest(clubA); // prefer different club
-    if (athleteB) ordered[idxB] = athleteB;
   }
 
-  // Step 2: fill BYE-match slots with remaining athletes
-  for (const [idxA, idxB] of byePairs) {
-    const realIdx = idxA < n ? idxA : (idxB < n ? idxB : -1);
-    if (realIdx < 0 || ordered[realIdx] !== null) continue;
-    const athlete = popLargest();
-    if (athlete) ordered[realIdx] = athlete;
-  }
-
-  // Place athletes into bracket slots
-  for (let i = 0; i < bracketSize; i++) {
-    slots[seedPositions[i]] = ordered[i];
+  // Place athletes into bracket slots: match k occupies slots 2k (red) and 2k+1 (blue)
+  for (let k = 0; k < N; k++) {
+    slots[2 * k]     = matchSlots[k][0];
+    slots[2 * k + 1] = matchSlots[k][1];
   }
 
   return slots;
