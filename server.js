@@ -956,6 +956,7 @@ app.get('/api/tournaments/:id/registrations', verifyToken, async (req, res) => {
     );
     res.json(r.rows);
   } catch (e) {
+    console.error('GET registrations error:', e);
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
@@ -964,10 +965,11 @@ app.post('/api/tournaments/:id/registrations', verifyToken, async (req, res) => 
   try {
     if (!await hasTournamentRole(req.user.userId, req.params.id, ['tournament_admin', 'weigh_in_manager'])) return res.status(403).json({ error: 'Accès refusé' });
     const { athlete_id, final_age_category, final_weight_category, final_style } = req.body;
-    // inline migration: ensure columns exist
+    // inline migrations: ensure columns and unique index exist
     await pool.query('ALTER TABLE tournament_registrations ADD COLUMN IF NOT EXISTS final_weight_category text').catch(() => {});
     await pool.query('ALTER TABLE tournament_registrations ADD COLUMN IF NOT EXISTS final_age_category text').catch(() => {});
     await pool.query('ALTER TABLE tournament_registrations ADD COLUMN IF NOT EXISTS final_style text').catch(() => {});
+    await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS uq_treg_tid_aid ON tournament_registrations(tournament_id, athlete_id)').catch(() => {});
     const r = await pool.query(
       'INSERT INTO tournament_registrations(id,tournament_id,athlete_id,final_age_category,final_weight_category,final_style) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(tournament_id,athlete_id) DO NOTHING RETURNING *',
       [uuidv4(), req.params.id, athlete_id, final_age_category || null, final_weight_category || null, final_style || null]
