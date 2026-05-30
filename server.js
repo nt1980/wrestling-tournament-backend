@@ -834,13 +834,14 @@ const detectDelimiter = (csv_data) => {
 
 const normalizeColumnName = (name) => {
   if (!name) return '';
-  // Strip Windows-1252 / encoding artifacts before normalising
   const cleaned = name.trim()
-    // Common Windows-1252 → UTF-8 mojibake sequences for French chars
+    // Decode Windows-1252 → UTF-8 mojibake sequences for French chars
     .replace(/Ã©/g, 'é').replace(/Ã¨/g, 'è').replace(/Ãª/g, 'ê')
     .replace(/Ã /g, 'à').replace(/Ã¢/g, 'â')
     .replace(/Ã´/g, 'ô').replace(/Ã®/g, 'î').replace(/Ã¹/g, 'ù').replace(/Ã»/g, 'û')
-    .replace(/Ã§/g, 'ç').replace(/Ã/g, 'à');
+    .replace(/Ã§/g, 'ç').replace(/Ã/g, 'à')
+    // Strip "numéro" symbols: °(U+00B0), º(U+00BA), ø(U+00F8) — FFLDA renders N° differently per export
+    .replace(/[°ºø]/g, '');
   return cleaned.toLowerCase()
     .replace(/[éèêë]/g, 'e')
     .replace(/[àâä]/g, 'a')
@@ -848,7 +849,9 @@ const normalizeColumnName = (name) => {
     .replace(/[ôö]/g, 'o')
     .replace(/[ùûü]/g, 'u')
     .replace(/ç/g, 'c')
-    .replace(/ñ/g, 'n');
+    .replace(/ñ/g, 'n')
+    .replace(/\s+/g, ' ')   // collapse double-spaces left by stripped ° (e.g. "N  Licence" → "n licence")
+    .trim();
 };
 
 const getColumnValue = (row, possibleNames) => {
