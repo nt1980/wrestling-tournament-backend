@@ -337,6 +337,7 @@ CREATE TABLE competitions (
   repechage_mode repechage_mode NOT NULL DEFAULT 'official_uww',
   athlete_count  INT NOT NULL DEFAULT 0,
   status         TEXT NOT NULL DEFAULT 'draft',  -- draft, running, finished
+  source         TEXT,                           -- NULL/'standard' = compétition normale, 'jeunes' = compétition jeunes
   created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (tournament_id, style, gender, age_category, weight_category)

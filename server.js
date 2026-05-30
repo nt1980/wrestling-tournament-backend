@@ -3334,6 +3334,10 @@ pool.query(`
 pool.query(`ALTER TABLE matches ADD COLUMN IF NOT EXISTS timer_state JSONB`)
   .catch(e => console.warn('Migration matches.timer_state:', e.message));
 
+// Source column on competitions (identifies jeunes vs standard competitions)
+pool.query(`ALTER TABLE competitions ADD COLUMN IF NOT EXISTS source TEXT`)
+  .catch(e => console.warn('Migration competitions.source:', e.message));
+
 server.listen(PORT, () => {
   console.log(`🏆 Lutte API démarrée sur le port ${PORT}`);
   console.log(`📍 Health: http://localhost:${PORT}/api/health`);
