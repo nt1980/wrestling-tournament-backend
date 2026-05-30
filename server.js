@@ -833,7 +833,22 @@ const detectDelimiter = (csv_data) => {
 };
 
 const normalizeColumnName = (name) => {
-  return name?.trim().toLowerCase().replace(/[éèê]/g, 'e').replace(/[àâ]/g, 'a').replace(/[ôo]/g, 'o').replace(/ç/g, 'c') || '';
+  if (!name) return '';
+  // Strip Windows-1252 / encoding artifacts before normalising
+  const cleaned = name.trim()
+    // Common Windows-1252 → UTF-8 mojibake sequences for French chars
+    .replace(/Ã©/g, 'é').replace(/Ã¨/g, 'è').replace(/Ãª/g, 'ê')
+    .replace(/Ã /g, 'à').replace(/Ã¢/g, 'â')
+    .replace(/Ã´/g, 'ô').replace(/Ã®/g, 'î').replace(/Ã¹/g, 'ù').replace(/Ã»/g, 'û')
+    .replace(/Ã§/g, 'ç').replace(/Ã/g, 'à');
+  return cleaned.toLowerCase()
+    .replace(/[éèêë]/g, 'e')
+    .replace(/[àâä]/g, 'a')
+    .replace(/[îï]/g, 'i')
+    .replace(/[ôö]/g, 'o')
+    .replace(/[ùûü]/g, 'u')
+    .replace(/ç/g, 'c')
+    .replace(/ñ/g, 'n');
 };
 
 const getColumnValue = (row, possibleNames) => {
@@ -911,14 +926,34 @@ app.post('/api/import/athletes', verifyToken, async (req, res) => {
         const license_number = getColumnValue(row, ['N° Licence', 'N Licence', 'License Number'])?.trim();
         if (!license_number) continue;
 
+        // Gender: try explicit column first, then infer from wrestling style
+        let gender = normalizeGender(getColumnValue(row, ['Sexe', 'Gender', 'Sexe/Genre']));
+        if (!gender) {
+          const rawStyle = getColumnValue(row, ['Style']) || '';
+          if (/f[eé]minin|feminine/i.test(rawStyle)) {
+            gender = 'F';
+          } else {
+            // No Sexe column in this CSV format — default to 'M'
+            // Female athletes in non-feminine styles must add the Sexe column to the export
+            gender = 'M';
+          }
+        }
+
         const existing = await pool.query('SELECT id FROM athletes WHERE license_number=$1', [license_number]);
+
+        // Clean nationality: strip Windows-1252 mojibake (e.g. "Fran硩s(e)" → "Français(e)")
+        const rawNat = getColumnValue(row, ['Nationalité', 'Nationalite', 'Nationality'])?.trim() || 'France';
+        const nationality = rawNat
+          .replace(/硩/g, 'ç')   // 0xE7 in Latin-1 misread as UTF-8
+          .replace(/[^\x00-\x7FÀ-ɏḀ-ỿ]/g, '?'); // replace remaining artifacts
+
         const athleteData = {
           license_number,
           first_name: getColumnValue(row, ['Prénom', 'Prenom', 'First Name'])?.trim(),
           last_name: getColumnValue(row, ['Nom', 'Name'])?.trim(),
-          gender: normalizeGender(getColumnValue(row, ['Sexe', 'Gender'])),
-          nationality: getColumnValue(row, ['Nationalité', 'Nationalite', 'Nationality'])?.trim() || 'France',
-          birth_date: normalizeDate(getColumnValue(row, ['Date de naissance', 'Date Naissance', 'Birth Date'])),
+          gender,
+          nationality,
+          birth_date: normalizeDate(getColumnValue(row, ['Date de naissance', 'Date naissance', 'Date Naissance', 'Birth Date'])),
           style: normalizeStyle(getColumnValue(row, ['Style'])),
           age_category_imported: getColumnValue(row, ['Catégorie d\'âge', 'Categorie age', 'Age Category'])?.trim(),
           licensed_age_category: getColumnValue(row, ['Cat âge licencié', 'Cat age licencie', 'Licensed Age Category'])?.trim(),
