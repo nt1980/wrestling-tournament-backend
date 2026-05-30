@@ -254,6 +254,72 @@ export async function deleteJeunesPools(tournamentId) {
   }
 }
 
+/**
+ * Delete jeunes data for a single age category (e.g. 'U9' or 'U11').
+ */
+export async function deleteJeunesPoolsByCategory(tournamentId, ageCategory) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Reset competition_id on registrations for this age category
+    await client.query(`
+      UPDATE tournament_registrations SET competition_id=NULL
+      WHERE tournament_id=$1
+        AND competition_id IN (
+          SELECT id FROM competitions
+          WHERE tournament_id=$1 AND source='jeunes' AND age_category=$2
+        )
+    `, [tournamentId, ageCategory]);
+
+    await client.query(`
+      DELETE FROM match_queue WHERE match_id IN (
+        SELECT m.id FROM matches m
+        JOIN competitions c ON c.id=m.competition_id
+        WHERE c.tournament_id=$1 AND c.source='jeunes' AND c.age_category=$2
+      )
+    `, [tournamentId, ageCategory]);
+
+    await client.query(`
+      DELETE FROM matches WHERE competition_id IN (
+        SELECT id FROM competitions WHERE tournament_id=$1 AND source='jeunes' AND age_category=$2
+      )
+    `, [tournamentId, ageCategory]);
+
+    await client.query(`
+      DELETE FROM pool_athletes WHERE pool_id IN (
+        SELECT p.id FROM pools p
+        JOIN competitions c ON c.id=p.competition_id
+        WHERE c.tournament_id=$1 AND c.source='jeunes' AND c.age_category=$2
+      )
+    `, [tournamentId, ageCategory]);
+
+    // Deleting pools also cascades to jeunes_pools (ON DELETE CASCADE)
+    await client.query(`
+      DELETE FROM pools WHERE competition_id IN (
+        SELECT id FROM competitions WHERE tournament_id=$1 AND source='jeunes' AND age_category=$2
+      )
+    `, [tournamentId, ageCategory]);
+
+    await client.query(
+      `DELETE FROM competitions WHERE tournament_id=$1 AND source='jeunes' AND age_category=$2`,
+      [tournamentId, ageCategory]
+    );
+
+    await client.query(
+      `DELETE FROM jeunes_unassigned WHERE tournament_id=$1 AND age_category=$2`,
+      [tournamentId, ageCategory]
+    );
+
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 async function _deleteJeunesPools(client, tournamentId) {
   // Reset competition_id on registrations
   await client.query(`

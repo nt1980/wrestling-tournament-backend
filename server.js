@@ -11,7 +11,7 @@ import { parse as csvParse } from 'csv-parse/sync';
 import nodemailer from 'nodemailer';
 import { generateNordic, generatePoolsAndFinals, generateBracket } from './services/bracket.js';
 import { computePoolRankings, computeBracketRankings, computeJeunesPoolRankings } from './services/ranking.js';
-import { generateJeunesPools, deleteJeunesPools } from './services/jeunes.js';
+import { generateJeunesPools, deleteJeunesPools, deleteJeunesPoolsByCategory } from './services/jeunes.js';
 
 dotenv.config();
 
@@ -2773,6 +2773,21 @@ app.delete('/api/tournaments/:id/jeunes', verifyToken, async (req, res) => {
     broadcastToTournament(req.params.id, { type: 'jeunes_updated' });
     res.json({ ok: true });
   } catch (e) { console.error(e); res.status(500).json({ error: 'Erreur suppression' }); }
+});
+
+// DELETE — Réinitialiser les poules jeunes pour une catégorie d'âge spécifique
+app.delete('/api/tournaments/:id/jeunes/reset/:ageCategory', verifyToken, async (req, res) => {
+  try {
+    if (!await hasTournamentRole(req.user.userId, req.params.id, ['tournament_admin']))
+      return res.status(403).json({ error: 'Accès refusé' });
+    const { ageCategory } = req.params;
+    const allowed = ['U9', 'U11', 'U13', 'U15'];
+    if (!allowed.includes(ageCategory))
+      return res.status(400).json({ error: `Catégorie invalide : ${ageCategory}` });
+    await deleteJeunesPoolsByCategory(req.params.id, ageCategory);
+    broadcastToTournament(req.params.id, { type: 'jeunes_updated' });
+    res.json({ ok: true, age_category: ageCategory });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'Erreur réinitialisation catégorie' }); }
 });
 
 // PUT — Assigner tapis et arbitre
