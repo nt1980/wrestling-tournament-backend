@@ -2296,17 +2296,17 @@ app.get('/api/tournaments/:id/dashboard', verifyToken, async (req, res) => {
         ORDER BY points DESC, gold DESC, silver DESC, bronze DESC
         LIMIT 5`, [tid]),
 
-      // Pesée par club × catégorie d'âge (athlètes avec weigh_in_status='done')
+      // Pesée par club × catégorie d'âge (tous les inscrits, count = pesés 'done')
       pool.query(`
         SELECT
-          COALESCE(c.short_name, c.name, 'Sans club') AS club_name,
-          COALESCE(tr.final_age_category, '?')         AS age_category,
-          COUNT(*)::int                                AS count
+          COALESCE(c.short_name, c.name, 'Sans club')              AS club_name,
+          COALESCE(tr.final_age_category, '?')                      AS age_category,
+          COUNT(*)::int                                             AS total,
+          COUNT(CASE WHEN tr.weigh_in_status = 'done' THEN 1 END)::int AS weighed
         FROM tournament_registrations tr
         JOIN athletes a ON a.id = tr.athlete_id
         LEFT JOIN clubs c ON c.id = a.club_id
         WHERE tr.tournament_id = $1
-          AND tr.weigh_in_status = 'done'
         GROUP BY c.id, c.short_name, c.name, tr.final_age_category
         ORDER BY c.name, tr.final_age_category
       `, [tid]),
