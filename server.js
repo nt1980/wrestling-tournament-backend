@@ -984,10 +984,14 @@ app.post('/api/import/athletes', verifyToken, async (req, res) => {
           created++;
         }
       } catch (rowErr) {
-        errors.push({ row: row['N° Licence'], error: rowErr.message });
+        const licNum = license_number || getColumnValue(row, ['N° Licence', 'N Licence', 'License Number']) || '?';
+        const nom = getColumnValue(row, ['Nom', 'Name']) || '';
+        const prenom = getColumnValue(row, ['Prénom', 'Prenom', 'First Name']) || '';
+        console.error(`[import] ERREUR licence=${licNum} ${nom} ${prenom}:`, rowErr.message);
+        errors.push({ license: licNum, name: `${nom} ${prenom}`.trim(), error: rowErr.message });
       }
     }
-    res.json({ created, updated, errors });
+    res.json({ created, updated, errors, total: records.length });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Erreur import' });
