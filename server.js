@@ -2213,7 +2213,7 @@ app.get('/api/tournaments/:id/dashboard', verifyToken, async (req, res) => {
 
     const [
       athletes, clubs, comps, matchesTotal, matchesDone, matsActive,
-      weighStats, queueStats, athletesByAge, matchesByAge, topClubs,
+      weighStats, queueStats, athletesByAge, matchesByAge, topClubs, weighByClubAge,
     ] = await Promise.all([
       pool.query('SELECT COUNT(*) FROM tournament_registrations WHERE tournament_id=$1', [tid]),
       pool.query('SELECT COUNT(DISTINCT a.club_id) FROM tournament_registrations tr JOIN athletes a ON a.id=tr.athlete_id WHERE tr.tournament_id=$1', [tid]),
@@ -2295,6 +2295,21 @@ app.get('/api/tournaments/:id/dashboard', verifyToken, async (req, res) => {
         GROUP BY club_id, club_name, short_name
         ORDER BY points DESC, gold DESC, silver DESC, bronze DESC
         LIMIT 5`, [tid]),
+
+      // Pesée par club × catégorie d'âge (athlètes avec weigh_in_status='done')
+      pool.query(`
+        SELECT
+          COALESCE(c.short_name, c.name, 'Sans club') AS club_name,
+          COALESCE(tr.final_age_category, '?')         AS age_category,
+          COUNT(*)::int                                AS count
+        FROM tournament_registrations tr
+        JOIN athletes a ON a.id = tr.athlete_id
+        LEFT JOIN clubs c ON c.id = a.club_id
+        WHERE tr.tournament_id = $1
+          AND tr.weigh_in_status = 'done'
+        GROUP BY c.id, c.short_name, c.name, tr.final_age_category
+        ORDER BY c.name, tr.final_age_category
+      `, [tid]),
     ]);
 
     const w = weighStats.rows[0];
@@ -2337,10 +2352,11 @@ app.get('/api/tournaments/:id/dashboard', verifyToken, async (req, res) => {
         on_mat: parseInt(q.on_mat),
         ready:  parseInt(q.ready),
       },
-      athletes_by_age: athletesByAge.rows,
-      matches_by_age:  matchesByAge.rows,
-      top_clubs:       clubs_medals,
+      athletes_by_age:     athletesByAge.rows,
+      matches_by_age:      matchesByAge.rows,
+      top_clubs:           clubs_medals,
       medals_total,
+      weigh_by_club_age:   weighByClubAge.rows,
     });
   } catch (e) {
     console.error('Dashboard error:', e);
